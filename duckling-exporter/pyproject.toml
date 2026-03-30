@@ -1,0 +1,11 @@
+[project]
+name = "duckling-exporter"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1.3",
+    "psycopg2-binary>=2.9.9",
+    "pyiceberg[s3fs]>=0.7.0",
+    "requests>=2.31.0",
+    "pyspark>=3.5.0",
+]

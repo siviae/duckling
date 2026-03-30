@@ -1,0 +1,109 @@
+services:
+
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qg
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ducklake
+      POSTGRES_USER: duckling
+      POSTGRES_PASSWORD: duckling
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  apicurio:
+    image: apicurio/apicurio-registry:3.0.0.Final
+    environment:
+      APICURIO_STORAGE_KIND: sql
+      APICURIO_DATASOURCE_URL: jdbc:postgresql://postgres:5432/apicurio
+      APICURIO_DATASOURCE_USERNAME: duckling
+      APICURIO_DATASOURCE_PASSWORD: duckling
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+
+  garage:
+    image: dxflrs/garage:v1.0.1
+    command: /garage server
+    volumes:
+      - ./local/garage.toml:/etc/garage.toml
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+    ports:
+      - "3900:3900"   # S3 API
+      - "3902:3902"   # admin API
+
+  lakekeeper:
+    image: quay.io/iceberg-catalog/iceberg-catalog:latest
+    environment:
+      ICEBERG_REST__BASE_URI: http://lakekeeper:8181
+      ICEBERG_REST__PG_DATABASE_URL_READ: postgresql://duckling:duckling@postgres:5432/ducklake
+      ICEBERG_REST__PG_DATABASE_URL_WRITE: postgresql://duckling:duckling@postgres:5432/ducklake
+    depends_on:
+      - postgres
+      - garage
+    ports:
+      - "8181:8181"
+
+  duckling:
+    build: ./duckling-landing
+    volumes:
+      - ./local/duckling.yaml:/etc/duckling/duckling.yaml
+    command: ["--config", "/etc/duckling/duckling.yaml"]
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      APICURIO_URL: http://apicurio:8080/apis/registry/v2
+      DUCKLAKE_CATALOG_POSTGRES_URL: jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling
+    depends_on:
+      - kafka
+      - apicurio
+      - postgres
+      - garage
+    ports:
+      - "9090:9090"   # Prometheus metrics
+
+  spark:
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm
+    working_dir: /opt/duckling-exporter
+    entrypoint: ["uv", "run", "exporter.py"]
+    environment:
+      AWS_ENDPOINT_URL: http://garage:3900
+      AWS_ACCESS_KEY_ID: "${GARAGE_ACCESS_KEY}"
+      AWS_SECRET_ACCESS_KEY: "${GARAGE_SECRET_KEY}"
+      DUCKLAKE_CATALOG_POSTGRES_URL: jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling
+      APICURIO_URL: http://apicurio:8080/apis/registry/v2
+      ICEBERG_REST_URL: http://lakekeeper:8181
+    volumes:
+      - ./duckling-exporter:/opt/duckling-exporter
+    depends_on:
+      - garage
+      - lakekeeper
+      - postgres
+
+volumes:
+  kafka_data:
+  postgres_data:
+  garage_meta:
+  garage_data:

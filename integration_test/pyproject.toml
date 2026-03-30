@@ -1,0 +1,15 @@
+[project]
+name = "duckling-integration-test"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "confluent-kafka==2.3.0",
+    "fastavro==1.9.4",
+    "psycopg2-binary==2.9.9",
+    "pyiceberg[s3fs]==0.7.1",
+    "requests==2.31.0",
+    "pytest==8.2.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-v -s"

@@ -1,0 +1,30 @@
+duckling:
+  kafka:
+    brokers: "kafka:9092"
+    schema_registry: "http://apicurio:8080/apis/registry/v2"
+
+  ducklake:
+    catalog_url: "jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling"
+
+  metrics:
+    prometheus:
+      port: 9090
+
+  adaptive:
+    safety_factor: 0.65
+    ema_alpha: 0.3
+
+  topics:
+    - name: test.orders
+      group_id: duckling-test-orders
+      table: test.orders
+      min_flush_interval_seconds: 30
+      max_flush_interval_seconds: 300
+      metadata_poll_interval_seconds: 10
+      offset_progress_flush_threshold: 0.5
+      max_batch_bytes: 67108864   # 64 MB ceiling
+
+    - name: test.events
+      group_id: duckling-test-events
+      table: test.events
+      max_batch_bytes: 67108864   # 64 MB ceiling
