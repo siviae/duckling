@@ -5,6 +5,7 @@ import io.company.duckling.sink.DuckLakeWriter
 import io.company.duckling.source.KafkaSource
 import io.company.duckling.source.SchemaValidator
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Tag.of
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -25,21 +26,28 @@ suspend fun runTopicPipeline(
     appBrokers: String,
     registryUrl: String,
     catalogUrl: String,
+    s3Endpoint: String,
+    s3AccessKey: String,
+    s3SecretKey: String,
     controller: AdaptiveController,
     registry: MeterRegistry?,
 ) {
     val recordsConsumed = registry?.counter("duckling_records_consumed_total", "topic", cfg.name)
-    val flushesTotal    = registry?.counter("duckling_flushes_total", "topic", cfg.name)
-    val batchBytesHist  = registry?.summary("duckling_batch_flushed_bytes", "topic", cfg.name)
+    val flushesTotal = registry?.counter("duckling_flushes_total", "topic", cfg.name)
+    val batchBytesHist = registry?.summary("duckling_batch_flushed_bytes", "topic", cfg.name)
 
     // Adaptive gauges — re-read from controller each scrape
     var currentBudget = controller.budgetFor(cfg.name, cfg)
-    registry?.gauge("duckling_adaptive_max_batch_bytes",
-        listOf(io.micrometer.core.instrument.Tag.of("topic", cfg.name)),
-        currentBudget) { it.maxBatchBytes.toDouble() }
-    registry?.gauge("duckling_adaptive_max_interval_seconds",
-        listOf(io.micrometer.core.instrument.Tag.of("topic", cfg.name)),
-        currentBudget) { it.maxFlushIntervalSeconds.toDouble() }
+    registry?.gauge(
+        "duckling_adaptive_max_batch_bytes",
+        listOf(of("topic", cfg.name)),
+        currentBudget
+    ) { it.maxBatchBytes.toDouble() }
+    registry?.gauge(
+        "duckling_adaptive_max_interval_seconds",
+        listOf(of("topic", cfg.name)),
+        currentBudget
+    ) { it.maxFlushIntervalSeconds.toDouble() }
 
     fun stopTopic(reason: String) {
         log.error("Stopping topic '${cfg.name}': $reason")
@@ -58,7 +66,8 @@ suspend fun runTopicPipeline(
     }
 
     val source = KafkaSource(appBrokers, registryUrl, cfg.group_id, cfg.name)
-    val writer = DuckLakeWriter(catalogUrl, cfg.isName, cfg.tableName)
+    //TODO since ensureTable will be called on init, this can be used using with (because it is autocloseable)
+    val writer = DuckLakeWriter(catalogUrl, cfg.isName, cfg.tableName, s3Endpoint, s3AccessKey, s3SecretKey)
 
     try {
         writer.ensureTable(initialSchema.columns)
@@ -84,12 +93,12 @@ suspend fun runTopicPipeline(
                 }
             }
 
-            var currentSchema     = initialSchema
-            val batch             = mutableListOf<GenericRecord>()
+            var currentSchema = initialSchema
+            val batch = mutableListOf<GenericRecord>()
             val batchStartOffsets = mutableMapOf<Int, Long>()
-            var batchBytes        = 0L
-            var lastFlushTime     = Instant.now()
-            var lastMetaPoll      = Instant.now()
+            var batchBytes = 0L
+            var lastFlushTime = Instant.now()
+            var lastMetaPoll = Instant.now()
 
             while (isActive) {
                 val now = Instant.now()
@@ -110,12 +119,12 @@ suspend fun runTopicPipeline(
                 if (metaElapsed >= cfg.metadata_poll_interval_seconds * 1000L && batch.isNotEmpty()) {
                     lastMetaPoll = now
                     try {
-                        val watermarks    = withContext(Dispatchers.IO) { source.highWatermarks() }
+                        val watermarks = withContext(Dispatchers.IO) { source.highWatermarks() }
                         val committedOffs = withContext(Dispatchers.IO) { source.currentOffsets() }
                         for ((partition, startOffset) in batchStartOffsets) {
-                            val hwm     = watermarks[partition] ?: continue
+                            val hwm = watermarks[partition] ?: continue
                             val current = committedOffs[partition] ?: startOffset
-                            val lag     = hwm - startOffset
+                            val lag = hwm - startOffset
                             if (lag > 0 && (current - startOffset).toDouble() / lag > cfg.offset_progress_flush_threshold) {
                                 flushByOffset = true
                                 break
@@ -126,15 +135,15 @@ suspend fun runTopicPipeline(
                     }
                 }
 
-                val elapsed          = Duration.between(lastFlushTime, now).toMillis()
-                val pastMin          = elapsed >= cfg.min_flush_interval_seconds * 1000L
+                val elapsed = Duration.between(lastFlushTime, now).toMillis()
+                val pastMin = elapsed >= cfg.min_flush_interval_seconds * 1000L
                 val pastEffectiveMax = elapsed >= currentBudget.maxFlushIntervalSeconds * 1000L
-                val overBudget       = batchBytes >= currentBudget.maxBatchBytes
+                val overBudget = batchBytes >= currentBudget.maxBatchBytes
 
                 // Byte trigger bypasses pastMin — it is a safety valve.
                 // Time and offset triggers respect the minimum interval.
                 val shouldFlush = batch.isNotEmpty() &&
-                    (overBudget || (pastMin && (pastEffectiveMax || flushByOffset)))
+                        (overBudget || (pastMin && (pastEffectiveMax || flushByOffset)))
 
                 if (shouldFlush) {
                     val refreshed = try {
@@ -176,13 +185,13 @@ suspend fun runTopicPipeline(
                     batchBytesHist?.record(batchBytes.toDouble())
                     log.info(
                         "Flushed ${batch.size} records (${batchBytes / 1024} KB) for '${cfg.name}'" +
-                        " — next budget: ${currentBudget.maxBatchBytes / (1024 * 1024)} MB" +
-                        " / ${currentBudget.maxFlushIntervalSeconds}s"
+                                " — next budget: ${currentBudget.maxBatchBytes / (1024 * 1024)} MB" +
+                                " / ${currentBudget.maxFlushIntervalSeconds}s"
                     )
 
                     batch.clear()
                     batchStartOffsets.clear()
-                    batchBytes    = 0L
+                    batchBytes = 0L
                     lastFlushTime = Instant.now()
                 }
 
@@ -201,8 +210,8 @@ suspend fun runTopicPipeline(
 private fun estimateBytes(record: GenericRecord): Long =
     record.schema.fields.sumOf { field ->
         when (val v = record.get(field.name())) {
-            is String    -> v.length.toLong() * 2 + 24  // UTF-16 chars + object header
+            is String -> v.length.toLong() * 2 + 24  // UTF-16 chars + object header
             is ByteArray -> v.size.toLong()
-            else         -> 8L                           // Long, Double, Boolean, null
+            else -> 8L                           // Long, Double, Boolean, null
         }
     }

@@ -5,6 +5,9 @@ duckling:
 
   ducklake:
     catalog_url: "jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling"
+    s3_endpoint: "http://garage:3900"
+    s3_access_key: "GK6475636b6c696e6700000000"
+    s3_secret_key: "6475636b6c696e6700000000000000000000000000000000000000000000dead"
 
   metrics:
     prometheus:
@@ -24,7 +27,3 @@ duckling:
       offset_progress_flush_threshold: 0.5
       max_batch_bytes: 67108864   # 64 MB ceiling
 
-    - name: test.events
-      group_id: duckling-test-events
-      table: test.events
-      max_batch_bytes: 67108864   # 64 MB ceiling

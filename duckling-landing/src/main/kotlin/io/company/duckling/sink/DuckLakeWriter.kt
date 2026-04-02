@@ -17,8 +17,11 @@ import java.sql.DriverManager
  */
 class DuckLakeWriter(
     catalogJdbcUrl: String,
-    private val isName: String,
-    private val tableName: String
+    isName: String,
+    tableName: String,
+    s3Endpoint: String = "",
+    s3AccessKey: String = "",
+    s3SecretKey: String = "",
 ) : AutoCloseable {
 
     private val conn: Connection
@@ -33,14 +36,32 @@ class DuckLakeWriter(
             stmt.execute("INSTALL ducklake")
             stmt.execute("LOAD ducklake")
 
+            if (s3Endpoint.isNotBlank() && s3AccessKey.isNotBlank()) {
+                val endpoint = s3Endpoint.removePrefix("http://").removePrefix("https://")
+                val useSsl = s3Endpoint.startsWith("https://")
+                stmt.execute("""
+                    CREATE SECRET duckling_s3 (
+                        TYPE S3,
+                        KEY_ID '$s3AccessKey',
+                        SECRET '$s3SecretKey',
+                        ENDPOINT '$endpoint',
+                        USE_SSL $useSsl,
+                        URL_STYLE 'path'
+                    )
+                """.trimIndent())
+            }
+
             val duckLakeUrl = jdbcToDuckLakeUrl(catalogJdbcUrl)
-            stmt.execute("""
-                ATTACH '$duckLakeUrl' AS ducklake (TYPE DUCKLAKE, DATA_PATH '$s3Path')
-            """.trimIndent())
+            stmt.execute(
+                """
+                ATTACH '$duckLakeUrl' AS ducklake (DATA_PATH '$s3Path')
+            """.trimIndent()
+            )
         }
     }
 
     /** Ensures the table exists with the given columns, applying evolution DDL as needed. */
+    //TODO do this on init
     fun ensureTable(columns: List<ColumnDef>) {
         val currentCols = currentColumns()
 
@@ -82,6 +103,7 @@ class DuckLakeWriter(
                     require(d.isFinite()) { "NaN or Infinity in column '${col.name}' is not permitted" }
                 }
             }
+
             "BIGINT" -> {
                 if (value is Number) {
                     val l = value.toLong()
@@ -132,14 +154,24 @@ class DuckLakeWriter(
             }
             result
         } catch (e: Exception) {
+            //TODO exception here and fail processing - should never happen
             emptyMap()
         }
     }
 
     private fun jdbcToDuckLakeUrl(jdbcUrl: String): String {
-        // jdbc:postgresql://host:port/db?params → postgres://host:port/db?params
-        return jdbcUrl.removePrefix("jdbc:")
-            .replace("postgresql://", "postgres://")
+        // jdbc:postgresql://host:port/db?user=u&password=p
+        // → ducklake:postgres:host=host port=port dbname=db user=u password=p
+        val withoutPrefix = jdbcUrl.removePrefix("jdbc:postgresql://")
+        val (hostPart, rest) = withoutPrefix.split("/", limit = 2)
+        val (host, port) = if (":" in hostPart) hostPart.split(":", limit = 2) else listOf(hostPart, "5432")
+        val (dbName, queryString) = if ("?" in rest) rest.split("?", limit = 2) else listOf(rest, "")
+        val params = queryString.split("&")
+            .filter { it.isNotEmpty() }
+            .joinToString(" ") { it.replace("=", "=") }
+        val pgConn = "host=$host port=$port dbname=$dbName" +
+            (if (params.isNotEmpty()) " $params" else "")
+        return "ducklake:postgres:$pgConn"
     }
 
     override fun close() {

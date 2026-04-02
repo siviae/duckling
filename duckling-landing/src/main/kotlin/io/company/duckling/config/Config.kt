@@ -18,7 +18,10 @@ data class KafkaConfig(
 )
 
 data class DuckLakeConfig(
-    val catalog_url: String
+    val catalog_url: String,
+    val s3_endpoint: String = "",
+    val s3_access_key: String = "",
+    val s3_secret_key: String = "",
 )
 
 data class MetricsConfig(

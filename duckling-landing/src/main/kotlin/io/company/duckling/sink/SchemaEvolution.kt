@@ -35,7 +35,7 @@ object SchemaEvolution {
                 current == "BIGINT" && col.duckType == "DOUBLE" -> WideningDef(col.name, "DOUBLE")
                 else -> error(
                     "Non-widening type change for column '${col.name}': $current → ${col.duckType}. " +
-                    "Only BIGINT → DOUBLE is permitted."
+                            "Only BIGINT → DOUBLE is permitted."
                 )
             }
         }

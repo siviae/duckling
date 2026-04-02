@@ -69,16 +69,17 @@ class SchemaValidator(private val registryUrl: String) {
 
     private fun mapAvroType(schema: Schema, fieldName: String): Pair<String, Boolean> {
         return when (schema.type) {
-            Schema.Type.STRING  -> Pair("VARCHAR", false)
-            Schema.Type.INT     -> Pair("BIGINT", false)
-            Schema.Type.LONG    -> Pair("BIGINT", false)
-            Schema.Type.FLOAT   -> Pair("DOUBLE", false)
-            Schema.Type.DOUBLE  -> Pair("DOUBLE", false)
+            Schema.Type.STRING -> Pair("VARCHAR", false)
+            Schema.Type.INT -> Pair("BIGINT", false)
+            Schema.Type.LONG -> Pair("BIGINT", false)
+            Schema.Type.FLOAT -> Pair("DOUBLE", false)
+            Schema.Type.DOUBLE -> Pair("DOUBLE", false)
             Schema.Type.BOOLEAN -> Pair("BOOLEAN", false)
-            Schema.Type.NULL    -> Pair("VARCHAR", true) // null-only field → nullable VARCHAR
-            Schema.Type.UNION   -> mapUnionType(schema, fieldName)
+            Schema.Type.NULL -> Pair("VARCHAR", true) // null-only field → nullable VARCHAR
+            Schema.Type.UNION -> mapUnionType(schema, fieldName)
             Schema.Type.RECORD, Schema.Type.ARRAY, Schema.Type.MAP ->
                 error("Field '$fieldName' has forbidden type ${schema.type} (nested objects/arrays/maps not allowed)")
+
             else -> error("Field '$fieldName' has unsupported Avro type ${schema.type}")
         }
     }

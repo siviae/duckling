@@ -1,10 +1,10 @@
 plugins {
-    kotlin("jvm") version "2.0.21"
+    kotlin("jvm") version "2.2.0"
     application
 }
 
 val kafkaVersion        = "3.7.0"
-val duckdbVersion       = "1.1.3"
+val duckdbVersion       = "1.5.1.0"
 val apicurioVersion     = "2.5.0.Final"
 val avroVersion         = "1.11.3"
 val jacksonVersion      = "2.17.0"

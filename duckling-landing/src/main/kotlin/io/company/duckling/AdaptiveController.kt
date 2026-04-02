@@ -40,17 +40,17 @@ class AdaptiveController(
      * Configured values in [cfg] are treated as upper bounds.
      */
     fun budgetFor(topic: String, cfg: TopicConfig): Budget {
-        val usableHeap   = (Runtime.getRuntime().maxMemory() * safetyFactor).toLong()
+        val usableHeap = (Runtime.getRuntime().maxMemory() * safetyFactor).toLong()
         val activeTopics = estimators.size.coerceAtLeast(1)
-        val heapBudget   = usableHeap / activeTopics
+        val heapBudget = usableHeap / activeTopics
 
-        val maxBytes     = minOf(heapBudget, cfg.max_batch_bytes)
+        val maxBytes = minOf(heapBudget, cfg.max_batch_bytes)
 
-        val bps          = estimators[topic]?.bytesPerSec ?: 0.0
-        val fillSeconds  = if (bps > 0.0) (maxBytes / bps).toInt()
-                           else cfg.max_flush_interval_seconds
+        val bps = estimators[topic]?.bytesPerSec ?: 0.0
+        val fillSeconds = if (bps > 0.0) (maxBytes / bps).toInt()
+        else cfg.min_flush_interval_seconds
 
-        val interval     = fillSeconds
+        val interval = fillSeconds
             .coerceIn(cfg.min_flush_interval_seconds, cfg.max_flush_interval_seconds)
 
         return Budget(maxBytes, interval)
@@ -66,6 +66,6 @@ class EmaEstimator(private val alpha: Double = 0.3) {
         if (elapsedSeconds <= 0.0) return
         val sample = bytes.toDouble() / elapsedSeconds
         bytesPerSec = if (bytesPerSec == 0.0) sample
-                      else alpha * sample + (1.0 - alpha) * bytesPerSec
+        else alpha * sample + (1.0 - alpha) * bytesPerSec
     }
 }

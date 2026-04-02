@@ -5,10 +5,10 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -18,6 +18,7 @@ services:
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qg
     ports:
       - "9092:9092"
+      - "29092:29092"
     volumes:
       - kafka_data:/var/lib/kafka/data
 
@@ -33,10 +34,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   apicurio:
-    image: apicurio/apicurio-registry:3.0.0.Final
+    image: apicurio/apicurio-registry:3.0.15
     environment:
       APICURIO_STORAGE_KIND: sql
-      APICURIO_DATASOURCE_URL: jdbc:postgresql://postgres:5432/apicurio
+      APICURIO_STORAGE_SQL_KIND: postgresql
+      APICURIO_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ducklake
       APICURIO_DATASOURCE_USERNAME: duckling
       APICURIO_DATASOURCE_PASSWORD: duckling
     depends_on:
@@ -53,17 +55,52 @@ services:
       - garage_data:/var/lib/garage/data
     ports:
       - "3900:3900"   # S3 API
-      - "3902:3902"   # admin API
+      - "3902:3902"   # web
+      - "3903:3903"   # admin API
 
-  lakekeeper:
-    image: quay.io/iceberg-catalog/iceberg-catalog:latest
+  garage-init:
+    image: dxflrs/garage:v1.0.1
+    command: >
+      /bin/sh -c "
+        sleep 3 &&
+        /garage layout assign -z local -c 1G \$$(/garage status 2>&1 | grep -oE '[0-9a-f]{16}' | head -1) &&
+        /garage layout apply --version 1 || true &&
+        /garage key import --yes duckling-local-key-id-00000001 duckling-local-secret-0000000000000000000000000000000000000001 -n duckling || true &&
+        /garage bucket create test || true &&
+        /garage bucket allow --read --write --owner test --key duckling-local-key-id-00000001 || true
+      "
     environment:
-      ICEBERG_REST__BASE_URI: http://lakekeeper:8181
-      ICEBERG_REST__PG_DATABASE_URL_READ: postgresql://duckling:duckling@postgres:5432/ducklake
-      ICEBERG_REST__PG_DATABASE_URL_WRITE: postgresql://duckling:duckling@postgres:5432/ducklake
+      GARAGE_RPC_HOST: garage:3901
+      GARAGE_RPC_SECRET: "aa11bb22cc33dd44ee55ff6677889900aabbccdd1122334455667788990011aa"
+    depends_on:
+      - garage
+    restart: "no"
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: ["migrate"]
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://duckling:duckling@postgres:5432/ducklake
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://duckling:duckling@postgres:5432/ducklake
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "duckling-local-dev-key"
     depends_on:
       - postgres
-      - garage
+    restart: "no"
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: ["serve"]
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://duckling:duckling@postgres:5432/ducklake
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://duckling:duckling@postgres:5432/ducklake
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "duckling-local-dev-key"
+    depends_on:
+      postgres:
+        condition: service_started
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      garage:
+        condition: service_started
     ports:
       - "8181:8181"
 
@@ -90,8 +127,8 @@ services:
     entrypoint: ["uv", "run", "exporter.py"]
     environment:
       AWS_ENDPOINT_URL: http://garage:3900
-      AWS_ACCESS_KEY_ID: "${GARAGE_ACCESS_KEY}"
-      AWS_SECRET_ACCESS_KEY: "${GARAGE_SECRET_KEY}"
+      AWS_ACCESS_KEY_ID: "duckling-local-key-id-00000001"
+      AWS_SECRET_ACCESS_KEY: "duckling-local-secret-0000000000000000000000000000000000000001"
       DUCKLAKE_CATALOG_POSTGRES_URL: jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling
       APICURIO_URL: http://apicurio:8080/apis/registry/v2
       ICEBERG_REST_URL: http://lakekeeper:8181

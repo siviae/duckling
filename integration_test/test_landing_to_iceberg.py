@@ -31,8 +31,8 @@ APICURIO_URL   = os.environ.get("APICURIO_URL",    "http://localhost:8080/apis/r
 POSTGRES_DSN   = os.environ.get("POSTGRES_DSN",    "postgresql://duckling:duckling@localhost:5432/ducklake")
 ICEBERG_URL    = os.environ.get("ICEBERG_REST_URL", "http://localhost:8181")
 S3_ENDPOINT    = os.environ.get("S3_ENDPOINT",     "http://localhost:3900")
-AWS_KEY        = os.environ.get("AWS_ACCESS_KEY_ID",     "minioadmin")
-AWS_SECRET     = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+AWS_KEY        = os.environ.get("AWS_ACCESS_KEY_ID",     "duckling-local-key-id-00000001")
+AWS_SECRET     = os.environ.get("AWS_SECRET_ACCESS_KEY", "duckling-local-secret-0000000000000000000000000000000000000001")
 
 # The topic / table we test against
 TOPIC     = "test.orders"
@@ -64,6 +64,37 @@ REGIONS = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _setup_garage() -> None:
+    """Ensures Garage node is configured, bucket exists, and access key is imported."""
+    cwd = os.path.join(os.path.dirname(__file__), "..")
+
+    def _exec(*cmd):
+        result = subprocess.run(
+            ["docker", "compose", "exec", "garage"] + list(cmd),
+            capture_output=True, text=True, cwd=cwd,
+        )
+        return result.stdout + result.stderr
+
+    # Get node ID and assign layout (idempotent — fails silently if already done)
+    status = _exec("/garage", "status")
+    node_id = next((w for w in status.split() if len(w) == 16 and all(c in "0123456789abcdef" for c in w)), None)
+    if node_id:
+        _exec("/garage", "layout", "assign", "-z", "local", "-c", "1G", node_id)
+        _exec("/garage", "layout", "apply", "--version", "1")
+
+    # Import key with known credentials (idempotent)
+    _exec("/garage", "key", "import", "--yes",
+          "duckling-local-key-id-00000001",
+          "duckling-local-secret-0000000000000000000000000000000000000001",
+          "-n", "duckling")
+
+    # Create bucket and grant access (idempotent)
+    _exec("/garage", "bucket", "create", "test")
+    _exec("/garage", "bucket", "allow", "--read", "--write", "--owner", "test",
+          "--key", "duckling-local-key-id-00000001")
+    print("Garage S3 configured.")
+
 
 def _wait_for_http(url: str, timeout: int = 60, interval: int = 3) -> None:
     """Polls url until it returns 2xx or timeout."""
@@ -176,15 +207,26 @@ def _produce_records(global_id: int, count: int) -> None:
 
 
 def _wait_for_ducklake_landing(table_name: str, min_files: int = 1, timeout: int = 90) -> None:
-    """Polls Postgres until at least `min_files` DuckLake data files are registered."""
+    """Polls Postgres until at least `min_files` DuckLake data files are registered.
+
+    DuckLake 1.5.x stores table names in ducklake_table as IS__topic__parts format.
+    The input table_name is IS_GROUP.ARTIFACT e.g. "test.test.orders".
+    We convert: drop IS_GROUP prefix -> "test.orders", replace "." with "__" -> "test__orders".
+    """
+    # Convert "is_group.topic.name" -> "topic__name" (DuckLake table_name format)
+    _, artifact = table_name.split(".", 1)
+    ducklake_name = artifact.replace(".", "__")
+
     pg = psycopg2.connect(POSTGRES_DSN)
     deadline = time.time() + timeout
     try:
         while time.time() < deadline:
             with pg.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) FROM ducklake_data_files WHERE table_name = %s",
-                    (table_name,),
+                    """SELECT COUNT(*) FROM ducklake_data_file f
+                       JOIN ducklake_table t ON f.table_id = t.table_id
+                       WHERE t.table_name = %s""",
+                    (ducklake_name,),
                 )
                 count = cur.fetchone()[0]
             if count >= min_files:
@@ -245,8 +287,12 @@ def test_data_lands_in_iceberg():
     End-to-end: produce ~10 MB to Kafka → Duckling lands in DuckLake
     → Spark exporter exports to Iceberg → count matches.
     """
+    # 0. Ensure Garage S3 is initialized
+    print("\n[0] Setting up Garage S3...")
+    _setup_garage()
+
     # 1. Wait for dependent services to be up
-    print("\n[1] Waiting for Apicurio...")
+    print("[1] Waiting for Apicurio...")
     _wait_for_http(f"{APICURIO_URL}/groups", timeout=60)
 
     # 2. Register schema and set BACKWARD compatibility

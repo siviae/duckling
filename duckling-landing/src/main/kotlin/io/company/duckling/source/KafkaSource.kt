@@ -36,11 +36,12 @@ class KafkaSource(
         consumer.subscribe(listOf(topic))
     }
 
-    fun poll(timeout: Duration): List<ConsumerRecord<ByteArray, GenericRecord>> {
+    fun poll(timeout: Duration): Iterable<ConsumerRecord<ByteArray, GenericRecord>> {
         val records = consumer.poll(timeout)
         return records.records(topic)
     }
 
+    //TODO combine two calls below so consumer.partitionsFor would not be called twice
     /** Returns map of partition → high watermark (end offset). */
     fun highWatermarks(): Map<Int, Long> {
         val partitions = consumer.partitionsFor(topic).map { TopicPartition(topic, it.partition()) }
