@@ -1,194 +1,104 @@
 """
-Duckling Spark Exporter
-=======================
-Discovers DuckLake tables ready for export, reads their Parquet files from
-MinIO, compacts them into 128MB Iceberg files, then marks the export complete
-and triggers DuckLake cleanup.
+Duckling Exporter
+=================
+Registers existing DuckLake Parquet files directly with Iceberg (Lakekeeper REST
+catalog) via add_files — no data is read or re-written.
 
-Run every 5 minutes via cron / Kubernetes CronJob:
+Run:
     uv run exporter.py
 """
+import json
 import os
 import duckdb
 import psycopg2
-from pyspark.sql import SparkSession
 from pyiceberg.catalog.rest import RestCatalog
-from schema_sync import sync_iceberg_schema
+from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg import types as T
+from pyiceberg.schema import Schema, NestedField
 
 DUCKLAKE_CATALOG_URL = os.environ["DUCKLAKE_CATALOG_POSTGRES_URL"]
-ICEBERG_REST_URL     = os.environ.get("ICEBERG_REST_URL", "http://lakekeeper:8181")
-APICURIO_URL         = os.environ.get("APICURIO_URL", "http://apicurio:8080/apis/registry/v2")
-S3_ENDPOINT          = os.environ.get("AWS_ENDPOINT_URL", "http://garage:3900")
-AWS_ACCESS_KEY       = os.environ["AWS_ACCESS_KEY_ID"]
-AWS_SECRET_KEY       = os.environ["AWS_SECRET_ACCESS_KEY"]
+ICEBERG_REST_URL = os.environ.get("ICEBERG_REST_URL", "http://lakekeeper:8181")
+S3_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://garage:3900")
+AWS_ACCESS_KEY = os.environ["AWS_ACCESS_KEY_ID"]
+AWS_SECRET_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 
-TARGET_FILE_BYTES    = 128 * 1024 * 1024  # 128 MB
-MIN_EXPORT_BYTES     = int(os.environ.get("DUCKLING_MIN_EXPORT_BYTES",  str(128 * 1024 * 1024)))
-MAX_EXPORT_AGE_MIN   = int(os.environ.get("DUCKLING_MAX_EXPORT_AGE_MIN", "60"))
-
-
-def build_spark() -> SparkSession:
-    return (
-        SparkSession.builder
-        .appName("duckling-exporter")
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.iceberg.type", "rest")
-        .config("spark.sql.catalog.iceberg.uri", ICEBERG_REST_URL)
-        .config("spark.sql.catalog.iceberg.warehouse", "landing")
-        .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
-        .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY)
-        .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_KEY)
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .getOrCreate()
-    )
+# DuckDB column_type → Iceberg type (bare type name, before any '(')
+_DUCKDB_TO_ICEBERG: dict[str, T.IcebergType] = {
+    "VARCHAR":   T.StringType(),
+    "TEXT":      T.StringType(),
+    "BIGINT":    T.LongType(),
+    "HUGEINT":   T.LongType(),
+    "INTEGER":   T.IntegerType(),
+    "INT":       T.IntegerType(),
+    "SMALLINT":  T.IntegerType(),
+    "TINYINT":   T.IntegerType(),
+    "DOUBLE":    T.DoubleType(),
+    "FLOAT":     T.FloatType(),
+    "BOOLEAN":   T.BooleanType(),
+    "BOOL":      T.BooleanType(),
+    "DATE":      T.DateType(),
+    "TIMESTAMP": T.TimestampType(),
+    "BLOB":      T.BinaryType(),
+}
 
 
-def find_export_candidates(pg_conn) -> list[dict]:
-    """Returns tables ready for export per the design criteria."""
-    query = """
-        SELECT
-            f.table_name,
-            e.last_exported_snapshot,
-            MAX(s.snapshot_id)     AS current_snapshot,
-            SUM(f.file_size_bytes) AS accumulated_bytes
-        FROM ducklake_data_files f
-        JOIN ducklake_snapshots s USING (snapshot_id)
-        LEFT JOIN ducklake_export_state e USING (table_name)
-        WHERE
-            (e.last_exported_snapshot IS NULL OR s.snapshot_id > e.last_exported_snapshot)
-            AND COALESCE(e.export_enabled, true) = true
-            AND COALESCE(e.export_blocked, false) = false
-        GROUP BY f.table_name, e.last_exported_snapshot
-        HAVING
-            SUM(f.file_size_bytes) >= %s
-            OR EXTRACT(EPOCH FROM NOW() - MIN(s.commit_time)) / 60 >= %s
-    """
-    with pg_conn.cursor() as cur:
-        cur.execute(query, (MIN_EXPORT_BYTES, MAX_EXPORT_AGE_MIN))
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+def _parse_jdbc_url(jdbc_url: str) -> dict:
+    without_prefix = jdbc_url.removeprefix("jdbc:postgresql://")
+    host_part, rest = without_prefix.split("/", 1)
+    host = host_part.split(":")[0]
+    port = int(host_part.split(":")[1]) if ":" in host_part else 5432
+    db_and_params = rest.split("?", 1)
+    dbname = db_and_params[0]
+    params: dict[str, str] = {}
+    if len(db_and_params) > 1:
+        for kv in db_and_params[1].split("&"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                params[k] = v
+    return {"host": host, "port": port, "dbname": dbname,
+            "user": params.get("user", "duckling"),
+            "password": params.get("password", "duckling")}
 
 
-def get_parquet_files(pg_conn, table_name: str, since_snapshot: int | None) -> list[str]:
-    query = """
-        SELECT DISTINCT f.file_path
-        FROM ducklake_data_files f
-        JOIN ducklake_snapshots s USING (snapshot_id)
-        WHERE f.table_name = %s
-          AND s.snapshot_id > %s
-    """
-    with pg_conn.cursor() as cur:
-        cur.execute(query, (table_name, since_snapshot or 0))
-        return [row[0] for row in cur.fetchall()]
+def _ducklake_attach_string(p: dict) -> str:
+    return (f"ducklake:postgres:host={p['host']} port={p['port']} "
+            f"dbname={p['dbname']} user={p['user']} password={p['password']}")
 
 
-def iceberg_table_name(ducklake_table: str) -> str:
-    """Converts 'is_name.table_name' to Iceberg 'landing.is_name__table_name'."""
-    return "landing." + ducklake_table.replace(".", "__")
+def _duckdb_type_to_iceberg(column_type: str) -> T.IcebergType:
+    base = column_type.upper().split("(")[0].strip()
+    return _DUCKDB_TO_ICEBERG.get(base, T.StringType())
 
 
-def ensure_export_state_row(pg_conn, table_name: str):
-    with pg_conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO ducklake_export_state (table_name)
-            VALUES (%s)
-            ON CONFLICT (table_name) DO NOTHING
-            """,
-            (table_name,),
+def main() -> None:
+    pg_params = _parse_jdbc_url(DUCKLAKE_CATALOG_URL)
+
+    # DuckDB connection — used only for schema discovery (DESCRIBE)
+    conn = duckdb.connect()
+    conn.execute("INSTALL ducklake; LOAD ducklake")
+    endpoint = S3_ENDPOINT.removeprefix("http://").removeprefix("https://")
+    use_ssl = S3_ENDPOINT.startswith("https://")
+    conn.execute(f"""
+        CREATE SECRET duckling_s3 (
+            TYPE S3,
+            KEY_ID '{AWS_ACCESS_KEY}',
+            SECRET '{AWS_SECRET_KEY}',
+            ENDPOINT '{endpoint}',
+            USE_SSL {str(use_ssl).lower()},
+            URL_STYLE 'path',
+            REGION 'garage'
         )
-    pg_conn.commit()
+    """)
+    conn.execute(f"ATTACH '{_ducklake_attach_string(pg_params)}' AS ducklake")
 
+    # Postgres connection — used to read DuckLake catalog (file paths)
+    pg = psycopg2.connect(**pg_params)
 
-def mark_exported_and_cleanup(pg_conn, ducklake_conn, table_name: str, snapshot_id: int):
-    with pg_conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE ducklake_export_state
-            SET last_exported_snapshot = %s,
-                last_export_time = NOW()
-            WHERE table_name = %s
-            """,
-            (snapshot_id, table_name),
-        )
-    pg_conn.commit()
-
-    ducklake_conn.execute(
-        "CALL ducklake_expire_snapshots('ducklake', up_to_snapshot => ?)",
-        [snapshot_id],
-    )
-    ducklake_conn.execute("CALL ducklake_cleanup('ducklake')")
-
-
-def export_table(
-    candidate: dict,
-    spark: SparkSession,
-    pg_conn,
-    ducklake_conn,
-    iceberg_catalog: RestCatalog,
-):
-    table_name      = candidate["table_name"]
-    last_exported   = candidate["last_exported_snapshot"]
-    current_snap    = candidate["current_snapshot"]
-    iceberg_name    = iceberg_table_name(table_name)
-
-    print(f"[export] {table_name} → {iceberg_name} (snap {last_exported} → {current_snap})")
-
-    parquet_files = get_parquet_files(pg_conn, table_name, last_exported)
-    if not parquet_files:
-        print(f"[export] No new files for {table_name}, skipping")
-        return
-
-    # Sync Iceberg schema to latest Apicurio schema
-    is_name, tbl = table_name.split(".", 1) if "." in table_name else (table_name, table_name)
-    try:
-        sync_iceberg_schema(
-            iceberg_catalog=iceberg_catalog,
-            iceberg_table_name=iceberg_name,
-            registry_url=APICURIO_URL,
-            group_id=is_name,
-            artifact_id=table_name,
-        )
-    except Exception as e:
-        print(f"[export] Schema sync failed for {table_name}: {e} — skipping")
-        return
-
-    df = (
-        spark.read
-        .option("mergeSchema", "true")
-        .parquet(*parquet_files)
-    )
-
-    (
-        df.writeTo(f"iceberg.{iceberg_name}")
-        .option("write.target-file-size-bytes", str(TARGET_FILE_BYTES))
-        .append()
-    )
-
-    mark_exported_and_cleanup(pg_conn, ducklake_conn, table_name, current_snap)
-    print(f"[export] Done: {table_name}")
-
-
-def main():
-    spark = build_spark()
-
-    pg_conn = psycopg2.connect(
-        # Convert jdbc:postgresql://... to psycopg2 DSN
-        dsn=DUCKLAKE_CATALOG_URL.replace("jdbc:postgresql://", "postgresql://")
-    )
-
-    ducklake_conn = duckdb.connect()
-    ducklake_conn.execute("INSTALL ducklake; LOAD ducklake")
-    ducklake_conn.execute(
-        f"ATTACH '{DUCKLAKE_CATALOG_URL.replace('jdbc:', '')}' AS ducklake (TYPE DUCKLAKE)"
-    )
-
-    iceberg_catalog = RestCatalog(
+    catalog = RestCatalog(
         name="landing",
         **{
-            "uri": ICEBERG_REST_URL,
+            "uri": f"{ICEBERG_REST_URL}/catalog",
+            "warehouse": "landing",
             "s3.endpoint": S3_ENDPOINT,
             "s3.access-key-id": AWS_ACCESS_KEY,
             "s3.secret-access-key": AWS_SECRET_KEY,
@@ -196,30 +106,68 @@ def main():
         },
     )
 
-    candidates = find_export_candidates(pg_conn)
-    print(f"[export] Found {len(candidates)} candidate table(s)")
+    tables = conn.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_catalog = 'ducklake' AND table_schema = 'main'"
+    ).fetchall()
+    print(f"[export] Found {len(tables)} table(s) in DuckLake")
 
-    for candidate in candidates:
-        ensure_export_state_row(pg_conn, candidate["table_name"])
+    for (table_name,) in tables:
         try:
-            export_table(candidate, spark, pg_conn, ducklake_conn, iceberg_catalog)
-        except Exception as e:
-            print(f"[export] ERROR exporting {candidate['table_name']}: {e}")
-            # Mark as blocked so we don't retry in a tight loop
-            with pg_conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE ducklake_export_state
-                    SET export_blocked = true, export_blocked_reason = %s
-                    WHERE table_name = %s
-                    """,
-                    (str(e), candidate["table_name"]),
-                )
-            pg_conn.commit()
+            # Get S3 Parquet file paths from DuckLake Postgres catalog
+            with pg.cursor() as cur:
+                cur.execute("""
+                    SELECT df.file_path
+                    FROM ducklake_data_file df
+                    JOIN ducklake_table dt ON dt.table_id = df.table_id
+                    WHERE dt.table_name = %s
+                """, (table_name,))
+                file_paths = [row[0] for row in cur.fetchall()]
 
-    ducklake_conn.close()
-    pg_conn.close()
-    spark.stop()
+            if not file_paths:
+                print(f"[export] No Parquet files for {table_name}, skipping")
+                continue
+            print(f"[export] {table_name}: {len(file_paths)} file(s)")
+
+            # Build Iceberg schema from DuckDB DESCRIBE (no data read)
+            columns = conn.execute(f'DESCRIBE ducklake.main."{table_name}"').fetchall()
+            iceberg_fields = [
+                NestedField(
+                    field_id=i + 1,
+                    name=col[0],
+                    field_type=_duckdb_type_to_iceberg(col[1]),
+                    required=(col[2] == "NO"),
+                )
+                for i, col in enumerate(columns)
+            ]
+            iceberg_schema = Schema(*iceberg_fields)
+
+            # Name mapping lets Iceberg readers resolve columns by name since
+            # DuckLake Parquet files have no embedded Iceberg field IDs.
+            name_mapping = json.dumps([
+                {"field-id": f.field_id, "names": [f.name]}
+                for f in iceberg_schema.fields
+            ])
+
+            ns = "landing"
+            try:
+                catalog.drop_table((ns, table_name))
+            except NoSuchTableError:
+                pass
+            tbl = catalog.create_table(
+                (ns, table_name),
+                schema=iceberg_schema,
+                properties={"schema.name-mapping.default": name_mapping},
+            )
+            tbl.add_files(file_paths)
+            print(f"[export] Registered {len(file_paths)} file(s) → {ns}.{table_name}")
+        except Exception as e:
+            print(f"[export] ERROR exporting {table_name}: {e}")
+            raise
+
+    conn.close()
+    pg.close()
+    print("[export] Done")
 
 
 if __name__ == "__main__":

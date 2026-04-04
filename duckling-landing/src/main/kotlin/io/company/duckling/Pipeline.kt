@@ -7,17 +7,20 @@ import io.company.duckling.source.SchemaValidator
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Tag.of
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import org.apache.avro.generic.GenericRecord
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.Executors
 
 private val log = LoggerFactory.getLogger("Pipeline")
 
@@ -29,6 +32,7 @@ suspend fun runTopicPipeline(
     s3Endpoint: String,
     s3AccessKey: String,
     s3SecretKey: String,
+    s3Region: String,
     controller: AdaptiveController,
     registry: MeterRegistry?,
 ) {
@@ -58,16 +62,22 @@ suspend fun runTopicPipeline(
 
     val validator = SchemaValidator(registryUrl)
 
-    val initialSchema = try {
-        validator.fetchAndValidate(cfg.isName, cfg.name)
-    } catch (e: Exception) {
-        stopTopic(e.message ?: "schema_validation_failed")
-        return
+    // Retry until the schema is available (Apicurio may not be ready at startup).
+    val initialSchema = run {
+        while (true) {
+            try {
+                return@run validator.fetchAndValidate(cfg.isName, cfg.name)
+            } catch (e: Exception) {
+                log.warn("Schema not ready for '${cfg.name}': ${e.message}. Retrying in 10s…")
+                delay(10_000)
+            }
+        }
+        @Suppress("UNREACHABLE_CODE") error("unreachable")
     }
 
     val source = KafkaSource(appBrokers, registryUrl, cfg.group_id, cfg.name)
     //TODO since ensureTable will be called on init, this can be used using with (because it is autocloseable)
-    val writer = DuckLakeWriter(catalogUrl, cfg.isName, cfg.tableName, s3Endpoint, s3AccessKey, s3SecretKey)
+    val writer = DuckLakeWriter(catalogUrl, cfg.isName, cfg.tableName, s3Endpoint, s3AccessKey, s3SecretKey, s3Region)
 
     try {
         writer.ensureTable(initialSchema.columns)
@@ -80,13 +90,20 @@ suspend fun runTopicPipeline(
 
     val recordChannel = Channel<ConsumerRecord<ByteArray, GenericRecord>>(capacity = 1000)
 
+    // Single-threaded context for all Kafka operations — KafkaConsumer is not thread-safe
+    val kafkaExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "kafka-${cfg.name}") }
+    val kafkaContext = kafkaExecutor.asCoroutineDispatcher()
+
     try {
         coroutineScope {
-            val producer = launch(Dispatchers.IO) {
+            val producer = launch(kafkaContext) {
                 try {
                     while (isActive) {
                         val polled = source.poll(Duration.ofMillis(500))
                         for (record in polled) recordChannel.send(record)
+                        // Yield so that withContext(kafkaContext) calls from the consumer loop
+                        // (highWatermarks, currentOffsets, commitSync) can run on this thread.
+                        yield()
                     }
                 } finally {
                     recordChannel.close()
@@ -105,6 +122,9 @@ suspend fun runTopicPipeline(
 
                 val record = recordChannel.tryReceive().getOrNull()
                 if (record != null) {
+                    // Reset flush timer when a new batch starts (not at pipeline startup)
+                    // so the 30s window measures time-since-first-record, not time-since-init
+                    if (batch.isEmpty()) lastFlushTime = Instant.now()
                     batchStartOffsets.putIfAbsent(record.partition(), record.offset())
                     batch.add(record.value())
                     batchBytes += estimateBytes(record.value())
@@ -119,8 +139,8 @@ suspend fun runTopicPipeline(
                 if (metaElapsed >= cfg.metadata_poll_interval_seconds * 1000L && batch.isNotEmpty()) {
                     lastMetaPoll = now
                     try {
-                        val watermarks = withContext(Dispatchers.IO) { source.highWatermarks() }
-                        val committedOffs = withContext(Dispatchers.IO) { source.currentOffsets() }
+                        val watermarks = withContext(kafkaContext) { source.highWatermarks() }
+                        val committedOffs = withContext(kafkaContext) { source.currentOffsets() }
                         for ((partition, startOffset) in batchStartOffsets) {
                             val hwm = watermarks[partition] ?: continue
                             val current = committedOffs[partition] ?: startOffset
@@ -154,23 +174,20 @@ suspend fun runTopicPipeline(
                         return@coroutineScope
                     }
 
-                    if (refreshed.columns != currentSchema.columns) {
-                        try {
-                            writer.ensureTable(refreshed.columns)
-                        } catch (e: Exception) {
-                            stopTopic("schema_evolution_failed: ${e.message}")
-                            producer.cancel()
-                            return@coroutineScope
-                        }
-                        currentSchema = refreshed
+                    // Always ensureTable — handles schema changes AND recreates dropped tables
+                    try {
+                        withContext(Dispatchers.IO) { writer.ensureTable(refreshed.columns) }
+                    } catch (e: Exception) {
+                        stopTopic("schema_evolution_failed: ${e.message}")
+                        producer.cancel()
+                        return@coroutineScope
                     }
+                    currentSchema = refreshed
 
                     val flushStart = Instant.now()
                     try {
-                        withContext(Dispatchers.IO) {
-                            writer.writeBatch(batch, currentSchema.columns)
-                            source.commitSync()
-                        }
+                        withContext(Dispatchers.IO) { writer.writeBatch(batch, currentSchema.columns) }
+                        withContext(kafkaContext) { source.commitSync() }
                     } catch (e: Exception) {
                         stopTopic("flush_failed: ${e.message}")
                         producer.cancel()
@@ -203,6 +220,7 @@ suspend fun runTopicPipeline(
     } finally {
         source.close()
         writer.close()
+        kafkaContext.close()
     }
 }
 

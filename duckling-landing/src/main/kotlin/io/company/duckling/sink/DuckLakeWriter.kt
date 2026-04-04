@@ -22,6 +22,7 @@ class DuckLakeWriter(
     s3Endpoint: String = "",
     s3AccessKey: String = "",
     s3SecretKey: String = "",
+    s3Region: String = "",
 ) : AutoCloseable {
 
     private val conn: Connection
@@ -39,6 +40,7 @@ class DuckLakeWriter(
             if (s3Endpoint.isNotBlank() && s3AccessKey.isNotBlank()) {
                 val endpoint = s3Endpoint.removePrefix("http://").removePrefix("https://")
                 val useSsl = s3Endpoint.startsWith("https://")
+                val regionClause = if (s3Region.isNotBlank()) ",\n                    REGION '$s3Region'" else ""
                 stmt.execute("""
                     CREATE SECRET duckling_s3 (
                         TYPE S3,
@@ -46,7 +48,7 @@ class DuckLakeWriter(
                         SECRET '$s3SecretKey',
                         ENDPOINT '$endpoint',
                         USE_SSL $useSsl,
-                        URL_STYLE 'path'
+                        URL_STYLE 'path'$regionClause
                     )
                 """.trimIndent())
             }
@@ -54,7 +56,7 @@ class DuckLakeWriter(
             val duckLakeUrl = jdbcToDuckLakeUrl(catalogJdbcUrl)
             stmt.execute(
                 """
-                ATTACH '$duckLakeUrl' AS ducklake (DATA_PATH '$s3Path')
+                ATTACH '$duckLakeUrl' AS ducklake (DATA_PATH '$s3Path', DATA_INLINING_ROW_LIMIT 0)
             """.trimIndent()
             )
         }
@@ -79,18 +81,37 @@ class DuckLakeWriter(
 
         val colNames = columns.joinToString(", ") { it.name }
         val placeholders = columns.joinToString(", ") { "?" }
-        val sql = "INSERT INTO ducklake.$fullTableName ($colNames) VALUES ($placeholders)"
 
-        conn.prepareStatement(sql).use { ps ->
-            for (record in records) {
-                for ((i, col) in columns.withIndex()) {
-                    val value = record.get(col.name)
-                    validateValue(col, value)
-                    ps.setObject(i + 1, value)
+        // Stage into a temp in-memory DuckDB table, then INSERT SELECT into DuckLake in one shot.
+        // Direct multi-row INSERT into DuckLake via JDBC prepared statements (even with explicit
+        // BEGIN/COMMIT) does not create a DuckLake data snapshot. A single INSERT...SELECT lets
+        // DuckLake manage its own transaction and creates exactly one Parquet snapshot.
+        val tempTable = "_batch_stage"
+        val colDefs = columns.joinToString(", ") { col ->
+            val nullability = if (col.nullable) "" else " NOT NULL"
+            "${col.name} ${col.duckType}$nullability"
+        }
+        conn.createStatement().use { it.execute("CREATE OR REPLACE TEMP TABLE $tempTable ($colDefs)") }
+
+        try {
+            conn.prepareStatement("INSERT INTO $tempTable ($colNames) VALUES ($placeholders)").use { ps ->
+                for (record in records) {
+                    for ((i, col) in columns.withIndex()) {
+                        val value = record.get(col.name)
+                        validateValue(col, value)
+                        ps.setObject(i + 1, value)
+                    }
+                    ps.addBatch()
                 }
-                ps.addBatch()
+                ps.executeBatch()
             }
-            ps.executeBatch()
+
+            // Single auto-committed statement — DuckLake creates one snapshot for the entire batch
+            conn.createStatement().use {
+                it.execute("INSERT INTO ducklake.$fullTableName SELECT * FROM $tempTable")
+            }
+        } finally {
+            try { conn.createStatement().use { it.execute("DROP TABLE IF EXISTS $tempTable") } } catch (_: Exception) {}
         }
     }
 
@@ -154,7 +175,6 @@ class DuckLakeWriter(
             }
             result
         } catch (e: Exception) {
-            //TODO exception here and fail processing - should never happen
             emptyMap()
         }
     }

@@ -65,9 +65,9 @@ services:
         sleep 3 &&
         /garage layout assign -z local -c 1G \$$(/garage status 2>&1 | grep -oE '[0-9a-f]{16}' | head -1) &&
         /garage layout apply --version 1 || true &&
-        /garage key import --yes duckling-local-key-id-00000001 duckling-local-secret-0000000000000000000000000000000000000001 -n duckling || true &&
+        /garage key import --yes GK6475636b6c696e6700000000 6475636b6c696e6700000000000000000000000000000000000000000000dead -n duckling || true &&
         /garage bucket create test || true &&
-        /garage bucket allow --read --write --owner test --key duckling-local-key-id-00000001 || true
+        /garage bucket allow --read --write --owner test --key GK6475636b6c696e6700000000 || true
       "
     environment:
       GARAGE_RPC_HOST: garage:3901
@@ -121,14 +121,15 @@ services:
     ports:
       - "9090:9090"   # Prometheus metrics
 
-  spark:
+  exporter:
     image: ghcr.io/astral-sh/uv:python3.12-bookworm
     working_dir: /opt/duckling-exporter
-    entrypoint: ["uv", "run", "exporter.py"]
+    entrypoint: ["uv"]
+    command: ["run", "exporter.py"]
     environment:
       AWS_ENDPOINT_URL: http://garage:3900
-      AWS_ACCESS_KEY_ID: "duckling-local-key-id-00000001"
-      AWS_SECRET_ACCESS_KEY: "duckling-local-secret-0000000000000000000000000000000000000001"
+      AWS_ACCESS_KEY_ID: "GK6475636b6c696e6700000000"
+      AWS_SECRET_ACCESS_KEY: "6475636b6c696e6700000000000000000000000000000000000000000000dead"
       DUCKLAKE_CATALOG_POSTGRES_URL: jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling
       APICURIO_URL: http://apicurio:8080/apis/registry/v2
       ICEBERG_REST_URL: http://lakekeeper:8181

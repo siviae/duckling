@@ -58,6 +58,7 @@ fun main(args: Array<String>) {
                         s3Endpoint = config.ducklake.s3_endpoint,
                         s3AccessKey = config.ducklake.s3_access_key,
                         s3SecretKey = config.ducklake.s3_secret_key,
+                        s3Region = config.ducklake.s3_region,
                         controller = controller,
                         registry = meterRegistry,
                     )

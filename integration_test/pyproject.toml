@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "confluent-kafka==2.3.0",
+    "duckdb>=1.5.1",
     "fastavro==1.9.4",
     "psycopg2-binary==2.9.9",
     "pyiceberg[s3fs]==0.7.1",

@@ -8,6 +8,7 @@ duckling:
     s3_endpoint: "http://garage:3900"
     s3_access_key: "GK6475636b6c696e6700000000"
     s3_secret_key: "6475636b6c696e6700000000000000000000000000000000000000000000dead"
+    s3_region: "garage"
 
   metrics:
     prometheus:
@@ -19,11 +20,11 @@ duckling:
 
   topics:
     - name: test.orders
-      group_id: duckling-test-orders
+      group_id: duckling-test-orders-e2ec1f46
       table: test.orders
-      min_flush_interval_seconds: 30
-      max_flush_interval_seconds: 300
-      metadata_poll_interval_seconds: 10
+      min_flush_interval_seconds: 5
+      max_flush_interval_seconds: 30
+      metadata_poll_interval_seconds: 5
       offset_progress_flush_threshold: 0.5
       max_batch_bytes: 67108864   # 64 MB ceiling
 

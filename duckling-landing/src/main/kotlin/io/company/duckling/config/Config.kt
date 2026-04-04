@@ -22,6 +22,7 @@ data class DuckLakeConfig(
     val s3_endpoint: String = "",
     val s3_access_key: String = "",
     val s3_secret_key: String = "",
+    val s3_region: String = "",
 )
 
 data class MetricsConfig(
