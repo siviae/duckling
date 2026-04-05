@@ -27,7 +27,7 @@ class DuckLakeWriter(
 
     private val conn: Connection
     private val fullTableName = "${isName}__${tableName.replace(".", "__")}"
-    private val s3Path = "s3://$isName/ducklake/$tableName/"
+    private val s3Path = "s3://$isName/ducklake/"
 
     init {
         Class.forName("org.duckdb.DuckDBDriver")
@@ -56,7 +56,7 @@ class DuckLakeWriter(
             val duckLakeUrl = jdbcToDuckLakeUrl(catalogJdbcUrl)
             stmt.execute(
                 """
-                ATTACH '$duckLakeUrl' AS ducklake (DATA_PATH '$s3Path', DATA_INLINING_ROW_LIMIT 0)
+                ATTACH '$duckLakeUrl' AS ducklake (DATA_PATH '$s3Path', OVERRIDE_DATA_PATH TRUE, DATA_INLINING_ROW_LIMIT 0)
             """.trimIndent()
             )
         }

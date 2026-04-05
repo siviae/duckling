@@ -130,9 +130,11 @@ services:
       AWS_ENDPOINT_URL: http://garage:3900
       AWS_ACCESS_KEY_ID: "GK6475636b6c696e6700000000"
       AWS_SECRET_ACCESS_KEY: "6475636b6c696e6700000000000000000000000000000000000000000000dead"
+      AWS_DEFAULT_REGION: garage
       DUCKLAKE_CATALOG_POSTGRES_URL: jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling
       APICURIO_URL: http://apicurio:8080/apis/registry/v2
       ICEBERG_REST_URL: http://lakekeeper:8181
+      ICEBERG_WAREHOUSE: landing
     volumes:
       - ./duckling-exporter:/opt/duckling-exporter
     depends_on:

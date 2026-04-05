@@ -19,12 +19,11 @@ duckling:
     ema_alpha: 0.3
 
   topics:
-    - name: test.orders
-      group_id: duckling-test-orders-e2ec1f46
-      table: test.orders
+    - name: test.orders_92693f16
+      group_id: duckling-test-orders_92693f16
+      table: test.orders_92693f16
       min_flush_interval_seconds: 5
       max_flush_interval_seconds: 30
       metadata_poll_interval_seconds: 5
       offset_progress_flush_threshold: 0.5
-      max_batch_bytes: 67108864   # 64 MB ceiling
-
+      max_batch_bytes: 67108864

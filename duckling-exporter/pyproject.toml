@@ -5,6 +5,6 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.1",
     "psycopg2-binary>=2.9",
-    "pyiceberg[s3fs]>=0.7.0",
+    "pyiceberg[pyarrow]>=0.9.0",
     "pyarrow>=14.0.0",
 ]
