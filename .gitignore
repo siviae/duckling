@@ -33,3 +33,4 @@ duckling-landing/build
 **/__pycache__/
 .claude
 *.iml
+local/

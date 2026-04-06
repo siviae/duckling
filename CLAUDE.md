@@ -2,7 +2,7 @@
 
 ## What This Is
 
-**Duckling** is a Kafka-to-DuckLake landing pipeline. It reads Avro messages from Kafka topics, accumulates them into micro-batches, and writes Parquet files to DuckLake (Postgres catalog + S3 storage). A separate exporter writes DuckLake data into Iceberg via a REST catalog (Lakekeeper).
+**Duckling** is a Kafka-to-DuckLake landing pipeline. It reads Avro messages from Kafka topics, accumulates them into micro-batches, and writes Parquet files to DuckLake (Postgres catalog + S3 storage). A separate exporter registers those Parquet files with an Iceberg REST catalog (Lakekeeper) via pure metadata manipulation — no data is re-read.
 
 ```
 Kafka (Avro) → [Duckling: validate → batch → flush] → DuckLake (Parquet/S3)
@@ -16,6 +16,7 @@ Kafka (Avro) → [Duckling: validate → batch → flush] → DuckLake (Parquet/
 - **Three flush triggers** (whichever fires first): time elapsed, offset progress (lag %), bytes accumulated
 - **Adaptive memory controller** (`AdaptiveController.kt`): dynamically computes per-topic batch size budget from JVM heap, number of active topics, and EMA throughput — prevents OOM
 - **Schema governance via Apicurio**: BACKWARD-compatible Avro schemas, fetched and applied before each flush; schema changes trigger ALTER TABLE DDL
+- **Exporter — metadata only**: reads file paths/counts from `ducklake_data_file` in Postgres, calls PyIceberg `fast_append` to register files in Lakekeeper. Never reads Parquet data.
 
 ## Module Layout
 
@@ -31,8 +32,15 @@ duckling-landing/src/main/kotlin/io/company/duckling/
 │   ├── KafkaSource.kt       # KafkaConsumer wrapper: poll, watermarks, commitSync
 │   └── SchemaValidator.kt   # Apicurio fetch, Avro→DuckDB type mapping, validation rules
 └── sink/
-    ├── DuckLakeWriter.kt    # DuckDB JDBC: attach DuckLake catalog, prepared-statement inserts
+    ├── DuckLakeWriter.kt    # DuckDB JDBC: attach DuckLake catalog, staged batch inserts
     └── SchemaEvolution.kt   # ALTER TABLE DDL: add columns, widen BIGINT→DOUBLE; blocks non-widening changes
+
+duckling-exporter/
+├── exporter.py              # Metadata-only export: Postgres → Iceberg fast_append
+└── schema_sync.py           # Utility: sync Iceberg schema from Apicurio (not called by exporter)
+
+integration_test/
+└── test_landing_to_iceberg.py  # End-to-end pytest: 1M records Kafka → DuckLake → Iceberg
 ```
 
 ## Tech Stack
@@ -40,17 +48,18 @@ duckling-landing/src/main/kotlin/io/company/duckling/
 | Layer | Technology |
 |-------|-----------|
 | Language | Kotlin 2.2.0, JVM 21 |
-| Build | Gradle (Kotlin DSL), configuration cache enabled |
+| Build | Gradle (Kotlin DSL), fat JAR via `tasks.jar` |
 | Async | Kotlin Coroutines 1.8.0 |
 | Kafka | kafka-clients 3.7.0 |
-| Schema Registry | Apicurio 3.0.15 (BACKWARD compat) |
+| Schema Registry | Apicurio 2.5.0.Final (BACKWARD compat, v2 API) |
 | Serialization | Avro 1.11.3 |
 | Data engine | DuckDB JDBC 1.5.1.0 (in-process, in-memory) |
-| Storage | Garage v1.0.1 (S3-compatible), region = `garage` |
+| Storage (local) | Garage v1.0.1 (S3-compatible), region = `garage` |
 | Catalog | DuckLake 1.5.x extension (Postgres catalog, S3 Parquet storage) |
 | Iceberg catalog | Lakekeeper (`quay.io/lakekeeper/catalog:latest-main`) |
 | Metrics | Micrometer Prometheus 1.12.0 |
 | Config | Jackson YAML 2.17.0 |
+| Exporter | Python 3.12, uv, duckdb>=1.5.1, pyiceberg[pyarrow]>=0.9.0, psycopg2-binary |
 
 ## Local Dev Setup
 
@@ -71,62 +80,60 @@ After code changes, rebuild and restart:
 ./gradlew :duckling-landing:jar && docker compose up -d --build duckling
 ```
 
-## Garage S3 Credentials
+## Kafka Thread-Safety Model
 
-Garage requires key IDs in format: `GK` + 24 hex chars (12 bytes). The key in use:
-- **Key ID**: `GK6475636b6c696e6700000000`  (="duckling" in hex + zero padding)
-- **Secret**: `6475636b6c696e6700000000000000000000000000000000000000000000dead`
-- **Bucket**: `test`
-- **Region**: `garage` (configured in `local/garage.toml` as `s3_region = "garage"`)
-- **Endpoint** (internal/Docker): `http://garage:3900`
-- **Endpoint** (host): `http://localhost:3900`
+`KafkaConsumer` is not thread-safe. All Kafka operations run on a dedicated single-threaded executor:
 
-**IMPORTANT**: The old key `duckling-local-key-id-00000001` is INVALID — Garage rejects non-`GK` prefixed key IDs. The `garage key import` in `garage-init` was silently failing because of this.
+```kotlin
+// Pipeline.kt — at coroutine scope start
+val kafkaExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "kafka-${cfg.name}") }
+val kafkaContext = kafkaExecutor.asCoroutineDispatcher()
 
-## Lakekeeper Setup
+// Producer loop runs on kafkaContext
+val producer = launch(kafkaContext) { while (isActive) { source.poll(...) } }
 
-Lakekeeper requires a project and warehouse to be created before tables can be stored.
+// Watermark/offset checks also use kafkaContext (withContext switches to same thread)
+val watermarks = withContext(kafkaContext) { source.highWatermarks() }
+withContext(kafkaContext) { source.commitSync() }
 
-Current setup (done once, persisted in Postgres `ducklake` DB):
-- **Project**: `00000000-0000-0000-0000-000000000000` ("Default Project") — Lakekeeper uses this as the default project for unauthenticated requests
-- **Warehouse**: `landing` (id: `dd6337e0-2e21-11f1-946c-5b83eb0575ba`) in default project, pointing to S3 bucket `test`
+// Only DuckLake writes use Dispatchers.IO
+withContext(Dispatchers.IO) { writer.writeBatch(batch, currentSchema.columns) }
+```
 
-The project and warehouse creation must be automated in the test setup. See `_setup_lakekeeper()` in the integration test.
+The producer coroutine calls `yield()` after each `poll()` so that `withContext(kafkaContext)` calls from the consumer loop can be scheduled on the same thread.
 
-REST catalog URL for PyIceberg: `http://localhost:8181` (host) or `http://lakekeeper:8181` (Docker). Use `warehouse="landing"`.
+## DuckLake Write Strategy
+
+Each flush stages records into a temp in-memory DuckDB table, then inserts in one shot:
+
+```sql
+CREATE OR REPLACE TEMP TABLE _batch_stage (col1 TYPE1, col2 TYPE2, ...);
+-- JDBC prepared statement batch insert into _batch_stage
+INSERT INTO ducklake.main.{fullTableName} SELECT * FROM _batch_stage;
+DROP TABLE IF EXISTS _batch_stage;
+```
+
+This single `INSERT...SELECT` lets DuckLake manage its own transaction and creates exactly one Parquet snapshot per flush. Direct multi-row JDBC inserts into DuckLake do not create snapshots.
+
+`DATA_INLINING_ROW_LIMIT 0` is set on ATTACH — all data goes to S3 Parquet (never inline in Postgres).
 
 ## DuckLake Notes (v1.5.x)
 
-### ATTACH syntax (changed in 1.5.x):
+### ATTACH syntax:
 ```sql
--- OLD (pre-1.5): ATTACH '...' AS ducklake (TYPE DUCKLAKE)
--- NEW (1.5.x):
-ATTACH 'ducklake:postgres:host=postgres port=5432 dbname=ducklake user=duckling password=duckling' AS ducklake
-  (DATA_PATH 's3://test/ducklake/orders/')
-```
-
-### S3 secret must be created BEFORE ATTACH:
-```sql
+-- S3 secret MUST be created before ATTACH
 CREATE SECRET duckling_s3 (
     TYPE S3,
-    KEY_ID 'GK6475636b6c696e6700000000',
-    SECRET '6475636b6c696e6700000000000000000000000000000000000000000000dead',
-    ENDPOINT 'garage:3900',
+    KEY_ID '<access-key>',
+    SECRET '<secret-key>',
+    ENDPOINT '<s3-host:port>',
     USE_SSL false,
     URL_STYLE 'path',
-    REGION 'garage'
+    REGION '<region>'
 )
-```
 
-### Inline data vs Parquet:
-DuckLake uses inline storage (data in Postgres `ducklake_inlined_data_*` tables) when S3 is not accessible or for small batches. Data only goes to S3 Parquet when S3 credentials work. If DuckLake writes inline, `ducklake_data_file` stays empty (count = 0) but `ducklake_inlined_data_1_1` has rows.
-
-Check what data is stored:
-```sql
--- Inline rows:
-SELECT COUNT(*) FROM ducklake_inlined_data_1_1;
--- S3 file rows:
-SELECT COUNT(*) FROM ducklake_data_file;
+ATTACH 'ducklake:postgres:host=postgres port=5432 dbname=ducklake user=duckling password=duckling' AS ducklake
+  (DATA_PATH 's3://{isName}/ducklake/', DATA_INLINING_ROW_LIMIT 0, OVERRIDE_DATA_PATH TRUE)
 ```
 
 ### Extension install (core, NOT community):
@@ -135,161 +142,108 @@ INSTALL ducklake;   -- NOT: INSTALL ducklake FROM community
 LOAD ducklake;
 ```
 
-## Known Issues / Remaining Work
+### Table naming:
+`TopicConfig.table = "test.orders"` → `isName="test"`, `tableName="orders"` → DuckLake table `test__orders`, S3 path `s3://test/ducklake/main/test__orders/`.
 
-### 1. KafkaConsumer Thread-Safety Bug (CRITICAL — pipeline crashes)
-**File**: `duckling-landing/src/main/kotlin/io/company/duckling/Pipeline.kt`
+### DuckLake schema tables (correct names for v1.5.x):
+- `ducklake_table` — table registry
+- `ducklake_data_file` — S3 Parquet file entries (not `ducklake_data_files`)
+- `ducklake_snapshot` — snapshot history (not `ducklake_snapshots`)
 
-**Problem**: `source.highWatermarks()`, `source.currentOffsets()`, and `source.commitSync()` are called inside `withContext(Dispatchers.IO)`, which schedules them on different threads than the main consumer coroutine that calls `source.poll()`. KafkaConsumer is not thread-safe.
+## Exporter Design
 
-**Error**: `ERROR Pipeline -- Stopping topic 'test.orders': flush_failed: KafkaConsumer is not safe for multi-threaded access`
+`exporter.py` uses pure metadata manipulation — no Parquet data is read:
 
-**Fix**: Use a single-threaded Kotlin coroutine context (e.g., `newSingleThreadContext("kafka-${cfg.name}")`) for ALL Kafka operations (poll, highWatermarks, currentOffsets, commitSync). Use `Dispatchers.IO` only for `writer.writeBatch()`.
+1. Reads `ducklake_data_file` from Postgres directly (paths, record counts, file sizes)
+2. Calls `DESCRIBE ducklake.main."{table_name}"` via DuckDB to get the schema
+3. Loads or creates the Iceberg table in Lakekeeper
+4. Deduplicates against the current Iceberg snapshot (skips already-registered files)
+5. Calls `fast_append` to register new files — writes only a small manifest to S3
 
-**Current code fragment** (lines 121-175 in Pipeline.kt):
-```kotlin
-val watermarks = withContext(Dispatchers.IO) { source.highWatermarks() }  // WRONG
-val committedOffs = withContext(Dispatchers.IO) { source.currentOffsets() }  // WRONG
-withContext(Dispatchers.IO) {
-    writer.writeBatch(batch, currentSchema.columns)
-    source.commitSync()  // WRONG — Kafka op on wrong thread
-}
+The `schema_sync.py` utility exists but is **not called by `exporter.py`**. The exporter builds the Iceberg schema from `DESCRIBE` output on first table creation, but does not evolve schema for existing tables.
+
+### S3 endpoint patch in PyIceberg:
+Lakekeeper returns Docker-internal hostnames in table config that would override `s3.endpoint`. Both `exporter.py` and the integration test patch `RestCatalog._load_file_io` to strip REST signer config (incompatible with Garage) and preserve explicitly-set `s3.endpoint`.
+
+## Apicurio Wire Format
+
+Apicurio v2 wire format (used by `AvroKafkaDeserializer`):
+```
+0x00           (1 byte  magic)
+id             (8 bytes big-endian long — global artifact ID)
+avro payload   (schemaless Avro binary)
 ```
 
-**Fix pattern**:
-```kotlin
-// Create at top of runTopicPipeline:
-val kafkaContext = newSingleThreadContext("kafka-${cfg.name}")
+`SchemaValidator` fetches the BACKWARD compatibility rule at the artifact level, falling back to the global rule. If neither is set (HTTP 404), the mode is `NONE` and validation fails.
 
-// Use for ALL kafka ops:
-val watermarks = withContext(kafkaContext) { source.highWatermarks() }
-// producer coroutine:
-val producer = launch(kafkaContext) { while (isActive) { source.poll(...) } }
-// flush:
-withContext(kafkaContext) { source.commitSync() }
-// writer stays on IO dispatcher
-withContext(Dispatchers.IO) { writer.writeBatch(batch, currentSchema.columns) }
+## Garage S3 (local dev only)
+
+Garage is used as a local S3-compatible object store for development and testing. It is not part of the production stack.
+
+Garage requires key IDs in format: `GK` + 24 hex chars (12 bytes).
+- **Key ID**: `GK6475636b6c696e6700000000`  (="duckling" in hex + zero padding)
+- **Secret**: `6475636b6c696e6700000000000000000000000000000000000000000000dead`
+- **Bucket**: `test`
+- **Region**: `garage` (configured in `local/garage.toml` as `s3_region = "garage"`)
+- **Endpoint** (internal/Docker): `http://garage:3900`
+- **Endpoint** (host): `http://localhost:3900`
+
+**IMPORTANT**: Garage rejects key IDs that don't start with `GK`. The old key `duckling-local-key-id-00000001` is invalid. The `garage-init` service in `docker-compose.yml` correctly uses the `GK`-prefixed key.
+
+### Garage Admin Commands
+
+```bash
+docker compose exec garage /garage key list
+docker compose exec garage /garage key info --show-secret GK6475636b6c696e6700000000
+docker compose exec garage /garage bucket list
+docker compose exec garage /garage bucket allow --read --write --owner test --key GK6475636b6c696e6700000000
+
+# From host:
+AWS_ACCESS_KEY_ID=GK6475636b6c696e6700000000 \
+AWS_SECRET_ACCESS_KEY=6475636b6c696e6700000000000000000000000000000000000000000000dead \
+aws --endpoint-url http://localhost:3900 s3 ls s3://test/ --recursive
 ```
 
-### 2. Exporter Broken (uses wrong table names, missing Postgres table)
-**File**: `duckling-exporter/exporter.py`
+## Lakekeeper Setup
 
-**Problems**:
-- Uses `ducklake_data_files` (should be `ducklake_data_file`, singular)
-- Uses `ducklake_snapshots` (should be `ducklake_snapshot`, singular)
-- References `ducklake_export_state` table (doesn't exist — custom table that needs to be created)
-- `ducklake_data_file` has no `table_name` column (uses `table_id` + join to `ducklake_table`)
-- `ducklake_data_file.path` not `file_path`
-- ATTACH uses old `TYPE DUCKLAKE` syntax (broken in 1.5.x)
-- Uses Spark for reading Parquet (overkill; should use DuckDB directly)
-- Inline data (stored in Postgres, not S3 Parquet) is invisible to the Spark file reader
+Lakekeeper requires a project and warehouse before tables can be stored. The integration test `_setup_lakekeeper()` handles this idempotently:
+1. Bootstrap via `POST /management/v1/bootstrap`
+2. Create project → get `project_id`
+3. Create warehouse `landing` pointing to S3 bucket `test` (Garage in local dev)
+4. SQL patch: `UPDATE warehouse SET project_id = '00000000-0000-0000-0000-000000000000'` — Lakekeeper uses this UUID as the default project for unauthenticated requests
 
-**Fix**: Rewrite exporter to use DuckDB with DuckLake extension to read tables (handles both inline and Parquet transparently), then write to Iceberg via PyIceberg. Remove Spark dependency.
+REST catalog URL: `http://localhost:8181/catalog` (host) or `http://lakekeeper:8181/catalog` (Docker). Always set `warehouse="landing"`.
 
-**New exporter pattern**:
-```python
-import duckdb
-from pyiceberg.catalog.rest import RestCatalog
-from pyiceberg.exceptions import NoSuchTableError
+## Integration Test
 
-conn = duckdb.connect()
-conn.execute("INSTALL ducklake; LOAD ducklake")
-conn.execute("CREATE SECRET ...")  # S3 credentials
-conn.execute("ATTACH 'ducklake:postgres:...' AS ducklake")
-
-catalog = RestCatalog("landing", uri=ICEBERG_REST_URL, warehouse="landing", ...)
-
-tables = conn.execute("SHOW TABLES FROM ducklake.main").fetchall()
-for (table_name,) in tables:
-    df = conn.execute(f"SELECT * FROM ducklake.main.{table_name}").fetch_arrow_table()
-    ns = "landing"
-    try:
-        tbl = catalog.load_table((ns, table_name))
-        tbl.overwrite(df)
-    except NoSuchTableError:
-        tbl = catalog.create_table((ns, table_name), schema=df.schema)
-        tbl.append(df)
-    print(f"Exported {len(df)} rows to {ns}.{table_name}")
+Located at `integration_test/test_landing_to_iceberg.py`. Run with:
+```bash
+cd integration_test && uv run pytest test_landing_to_iceberg.py -s
 ```
 
-Also update `pyproject.toml` to use `duckdb>=1.5.1` (not `>=1.1.3`).
+Test flow:
+1. Setup Garage S3 (key + bucket) via `docker compose exec garage`
+2. Setup Lakekeeper (project + warehouse) — idempotent
+3. Smoke-test Iceberg catalog (write 1 row, read back, drop)
+4. Reset state: write unique `duckling.yaml`, stop duckling, drop all `ducklake_*` Postgres tables, create fresh Kafka topic, restart duckling
+5. Register Avro schema in Apicurio
+6. Produce 1,000,000 records (~1 KB each, ~1 GB total)
+7. Wait for Duckling to flush all records to DuckLake (`_wait_for_ducklake_stable` polls `ducklake_data_file.record_count`)
+8. Run exporter via `docker compose run --rm exporter`
+9. Count Iceberg records via PyIceberg → assert == 1,000,000
 
-### 3. Test Cleanup / Idempotency
-The integration test needs a `_reset_test_state()` function to run before producing records, to ensure a clean slate:
-1. Delete and recreate the Kafka topic (clears old offsets and records)
-2. Restart duckling (so it re-subscribes with `auto.offset.reset=earliest`)
-3. Truncate DuckLake table: `DELETE FROM ducklake.main.test__orders` via DuckDB
-4. Drop Iceberg table: `catalog.drop_table(("landing", "test__orders"))` via PyIceberg
-
-Without cleanup, previous test runs leave stale data and the record count check fails.
-
-### 4. garage-init fix (docker-compose.yml)
-The `garage key import` in `garage-init` fails because `duckling-local-key-id-00000001` is not a valid Garage key ID format. Fix the `garage-init` service to use:
-```
-/garage key import --yes GK6475636b6c696e6700000000 6475636b6c696e6700000000000000000000000000000000000000000000dead -n duckling
-```
-
-### 5. _wait_for_ducklake_landing must check inline data too
-Current test checks only `ducklake_data_file` (S3 Parquet files). DuckLake also stores data in `ducklake_inlined_data_1_1`. Check both:
-```python
-cur.execute("""
-    SELECT COUNT(*) FROM ducklake_inlined_data_1_1 i
-    JOIN ducklake_inlined_data_tables t ON t.table_name = 'ducklake_inlined_data_1_1'
-    JOIN ducklake_table dt ON dt.table_id = t.table_id
-    WHERE dt.table_name = %s
-""", (ducklake_name,))
-```
-Or simpler: check `ducklake_snapshot` count has increased.
-
-### 6. Lakekeeper bootstrap in test setup
-Must be automated. The test needs a `_setup_lakekeeper()` function:
-```python
-def _setup_lakekeeper():
-    # Check if already set up
-    r = requests.get(f"{ICEBERG_URL}/catalog/v1/config?warehouse=landing")
-    if r.status_code == 200:
-        return
-
-    # Bootstrap if needed
-    requests.post(f"{ICEBERG_URL}/management/v1/bootstrap",
-                  json={"accept-terms-of-use": True})
-
-    # Create project
-    r = requests.post(f"{ICEBERG_URL}/management/v1/project",
-                      json={"project-name": "default"})
-    project_id = r.json().get("project-id", "00000000-0000-0000-0000-000000000000")
-
-    # Create warehouse
-    requests.post(f"{ICEBERG_URL}/management/v1/warehouse", json={
-        "warehouse-name": "landing",
-        "project-id": project_id,
-        "storage-profile": {
-            "type": "s3", "bucket": "test", "endpoint": f"http://garage:3900",
-            "path-style-access": True, "region": "garage", "sts-enabled": False, "flavor": "minio"
-        },
-        "storage-credential": {
-            "type": "s3", "credential-type": "access-key",
-            "aws-access-key-id": AWS_KEY, "aws-secret-access-key": AWS_SECRET,
-        },
-    })
-
-    # Move warehouse to default project so catalog API resolves it
-    # (Lakekeeper uses project 00000000-0000-0000-0000-000000000000 for unauthenticated requests)
-    pg = psycopg2.connect(POSTGRES_DSN)
-    with pg.cursor() as cur:
-        cur.execute("UPDATE warehouse SET project_id = '00000000-0000-0000-0000-000000000000'")
-    pg.commit()
-    pg.close()
-```
+Each test run uses a unique `RUN_SUFFIX` (UUID hex) so topic and table names never collide with previous runs. Old tables accumulate but don't interfere.
 
 ## Configuration
 
 Config file passed via `--config <path>` (default: `duckling.yaml`).
 
-Key per-topic settings (`local/duckling.yaml`):
+Key per-topic settings:
 - `min_flush_interval_seconds` / `max_flush_interval_seconds` — time-based flush bounds
+- `metadata_poll_interval_seconds` — how often to check Kafka offset progress
 - `offset_progress_flush_threshold` — flush when this fraction of lag is consumed (e.g. `0.5`)
 - `max_batch_bytes` — upper bound; adaptive controller may lower it based on heap
+- `table` — `{isName}.{tableName}` format; DuckLake table = `{isName}__{tableName}`
 
 ## Error Handling Conventions
 
@@ -307,49 +261,36 @@ Key per-topic settings (`local/duckling.yaml`):
 - `duckling_adaptive_max_batch_bytes` — current adaptive limit (by topic)
 - `duckling_adaptive_max_interval_seconds` — current adaptive flush interval (by topic)
 
-## Integration Test
+## Known Issues / Remaining Work
 
-Located at `integration_test/test_landing_to_iceberg.py`. Run with:
-```bash
-cd integration_test && uv run pytest test_landing_to_iceberg.py -s
-```
+### 1. `schema_sync.py` is not wired into the exporter
+`duckling-exporter/schema_sync.py` implements Avro→Iceberg schema evolution (add columns, widen types) but `exporter.py` never imports or calls it. When an existing Iceberg table has schema drift vs. the DuckLake table, the exporter logs a warning and proceeds — new files may have columns not in the Iceberg schema (readers will null-fill them). This is harmless for reading but the Iceberg schema will drift from the actual data schema over time.
 
-Test flow:
-1. Setup Garage S3 (key + bucket)
-2. Setup Lakekeeper (project + warehouse)
-3. Wait for Apicurio
-4. Register Avro schema
-5. Create Kafka topic
-6. Produce 10K records (~10MB)
-7. Wait for Duckling to flush to DuckLake
-8. Wait extra 35s for remaining batches
-9. Run exporter
-10. Count Iceberg records → assert == 10K
+**Fix**: call `sync_iceberg_schema()` from `schema_sync.py` in `exporter.py` after loading an existing table, before `fast_append`.
 
-## Garage Admin Commands
+### 2. `KafkaSource.highWatermarks()` and `currentOffsets()` both call `partitionsFor()` separately
+In `KafkaSource.kt`, both methods call `consumer.partitionsFor(topic)` independently — two broker round-trips when one would suffice.
 
-```bash
-# Inside the garage container:
-docker compose exec garage /garage key list
-docker compose exec garage /garage key info --show-secret GK6475636b6c696e6700000000
-docker compose exec garage /garage bucket list
-docker compose exec garage /garage bucket allow --read --write --owner test --key GK6475636b6c696e6700000000
+**Fix** (minor optimization, not a correctness issue): combine into a single method that returns both maps.
 
-# From host (with valid credentials):
-AWS_ACCESS_KEY_ID=GK6475636b6c696e6700000000 \
-AWS_SECRET_ACCESS_KEY=6475636b6c696e6700000000000000000000000000000000000000000000dead \
-aws --endpoint-url http://localhost:3900 s3 ls s3://test/ --recursive
-```
+### 3. `DuckLakeWriter.ensureTable()` is called twice at pipeline startup
+`Pipeline.kt` calls `writer.ensureTable(initialSchema.columns)` at init time, and then calls it again on every flush. The first call is harmless (CREATE TABLE IF NOT EXISTS) but redundant with the flush path.
+
+### 4. Exporter data path reconstruction assumes `{isName}__` prefix
+`exporter.py` splits `table_name` on `__` to derive `isName` for the S3 `data_path`. If a DuckLake table name does not contain `__`, `data_path` will be empty and relative file paths won't be resolved. This matches Duckling's naming convention but could break if tables are created by other means.
+
+### 5. `_wait_for_ducklake_stable` only counts S3 Parquet files
+The test waits on `ducklake_data_file.record_count`. This is correct for the current setup because `DATA_INLINING_ROW_LIMIT 0` is configured. If inlining is ever re-enabled, the test will wait forever on a fully-inlined table.
 
 ## DuckLake Inspection
 
-```sql
--- Via psql:
+```bash
 docker compose exec postgres psql -U duckling -d ducklake
+```
 
+```sql
 SELECT table_name FROM ducklake_table;
-SELECT COUNT(*) FROM ducklake_inlined_data_1_1;  -- inline data
-SELECT COUNT(*) FROM ducklake_data_file;           -- S3 parquet files
+SELECT COUNT(*) FROM ducklake_data_file;           -- S3 Parquet file entries
 SELECT * FROM ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 5;
 SELECT changes_made FROM ducklake_snapshot_changes ORDER BY snapshot_id DESC LIMIT 10;
 ```

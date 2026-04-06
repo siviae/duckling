@@ -75,6 +75,7 @@ DUCKLAKE_TABLE = f"test__orders_{RUN_SUFFIX}"
 ICEBERG_TABLE  = f"landing.{DUCKLAKE_TABLE}"
 
 # How many records to produce (≈1 KB each → ~10 MB total)
+#RECORD_COUNT = 1_000_000
 RECORD_COUNT = 10_000
 
 # Avro schema registered in Apicurio
@@ -414,17 +415,19 @@ def _produce_records(global_id: int, count: int) -> None:
     print(f"Produced {count} records to '{TOPIC}'")
 
 
-def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 120) -> int:
-    """Waits until the DuckLake data file count for DUCKLAKE_TABLE has been non-zero
-    and stable for `stable_for` seconds.  Returns the final snapshot_id.
+def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 300,
+                              target_rows: int | None = None) -> int:
+    """Waits until data row count is stable.  Returns the final snapshot_id.
 
-    Checks ducklake_data_file directly so we don't mistake the CREATE TABLE snapshot
-    (which has no data files yet) for a completed data flush.
+    If target_rows is given, returns as soon as that count is reached (regardless
+    of the stability window).  Otherwise waits for the count to be non-zero and
+    unchanged for stable_for seconds.
     """
     pg = psycopg2.connect(POSTGRES_DSN)
     deadline = time.time() + timeout
     last_count = 0
     stable_since: float | None = None
+    max_snap = 0
     try:
         while time.time() < deadline:
             try:
@@ -447,10 +450,17 @@ def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 120) -> int:
 
             now = time.time()
             elapsed = timeout - (deadline - now)
+
+            # Target-based exit: return as soon as all expected rows have landed.
+            if target_rows is not None and row_count >= target_rows:
+                print(f"  [{elapsed:.1f}s] DuckLake: data rows={row_count}, snapshot={max_snap} ✓ target reached")
+                return max_snap
+
             if row_count != last_count:
                 last_count = row_count
                 stable_since = now
-                print(f"  [{elapsed:.1f}s] DuckLake: data rows={row_count}, snapshot={max_snap} (changed)")
+                pct = f" ({100*row_count//target_rows}%)" if target_rows else ""
+                print(f"  [{elapsed:.1f}s] DuckLake: data rows={row_count}{pct}, snapshot={max_snap} (changed)")
             else:
                 if row_count > 0 and stable_since is not None:
                     stable_secs = now - stable_since
@@ -462,7 +472,7 @@ def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 120) -> int:
             time.sleep(2)
     finally:
         pg.close()
-    return max_snap  # type: ignore[return-value]
+    return max_snap
 
 
 def _run_exporter() -> None:
@@ -520,9 +530,9 @@ def test_data_lands_in_iceberg():
     print(f"[4] Producing {RECORD_COUNT} records (~10 MB) to '{TOPIC}'...")
     _produce_records(global_id, RECORD_COUNT)
 
-    # 5. Wait for Duckling to flush actual data files to DuckLake (not just DDL snapshot).
+    # 5. Wait for Duckling to flush all records to DuckLake.
     print("[5] Waiting for Duckling to land data in DuckLake...")
-    final_snap = _wait_for_ducklake_stable(stable_for=8, timeout=120)
+    final_snap = _wait_for_ducklake_stable(stable_for=8, timeout=300, target_rows=RECORD_COUNT)
     print(f"    DuckLake stable with data at snapshot {final_snap}.")
 
     # 6. Run the exporter
