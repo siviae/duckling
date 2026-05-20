@@ -1,3 +1,13 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "duckdb>=1.5.1",
+#     "psycopg2-binary>=2.9",
+#     "pyiceberg[pyarrow,s3fs]>=0.9.0",
+#     "pyarrow>=14.0.0",
+# ]
+# ///
 """
 Duckling Exporter
 =================
@@ -11,6 +21,7 @@ Strategy:
   4. fast_append        → write manifest metadata only            (small S3 write)
 
 Run:
+    ./exporter.py
     uv run exporter.py
 """
 import json
@@ -33,9 +44,13 @@ from pyiceberg.typedef import Record
 # direct S3 credentials are present so that PyArrowFileIO can authenticate directly.
 def _patched_load_file_io(self, properties=None, location=None):
     merged = {**self.properties, **(properties or {})}
+    # Restore s3.endpoint so the Docker-internal hostname returned by Lakekeeper
+    # doesn't override the explicitly-configured catalog endpoint.
+    if "s3.endpoint" in self.properties:
+        merged["s3.endpoint"] = self.properties["s3.endpoint"]
     # Strip REST signer config so FsspecFileIO uses direct aiobotocore SigV4 signing,
-    # which is compatible with Garage (unlike PyArrowFileIO's streaming SHA256 uploads,
-    # and unlike Lakekeeper's REST signer which requires a token we don't have).
+    # which is compatible with Garage (unlike Lakekeeper's REST signer which requires
+    # a token we don't have).
     if "s3.access-key-id" in self.properties:
         for k in [k for k in merged if k.startswith("s3.signer")]:
             del merged[k]
@@ -169,12 +184,14 @@ def _ducklake_attach_string(p: dict) -> str:
 
 
 def main() -> None:
+    if os.environ.get("UV_PREWARM"):
+        print("[export] Prewarm: dependencies installed.")
+        return
+
     endpoint_no_scheme = S3_ENDPOINT.removeprefix("http://").removeprefix("https://")
     use_ssl = S3_ENDPOINT.startswith("https://")
 
     # Initialise PyArrow's S3 subsystem once (suppresses verbose C++ logs).
-    # PyArrowFileIO will use the credentials/endpoint from the catalog properties
-    # below to construct its own S3FileSystem for each manifest write.
     pafs.initialize_s3(pafs.S3LogLevel.Fatal)
 
     pg_params = _parse_jdbc_url(DUCKLAKE_CATALOG_URL)
@@ -192,7 +209,7 @@ def main() -> None:
             REGION 'garage'
         )
     """)
-    conn.execute(f"ATTACH '{_ducklake_attach_string(pg_params)}' AS ducklake")
+    conn.execute(f"ATTACH '{_ducklake_attach_string(pg_params)}' AS ducklake (AUTOMATIC_MIGRATION TRUE)")
 
     pg = psycopg2.connect(**pg_params)
 
@@ -217,14 +234,6 @@ def main() -> None:
     ns = ICEBERG_WAREHOUSE
     for (table_name,) in tables:
         try:
-            # -----------------------------------------------------------------
-            # 1. File metadata from DuckLake Postgres — no S3 access.
-            #    DuckLake stores relative filenames; reconstruct full S3 URIs:
-            #      fullTableName = {isName}__{tableName}
-            #      DATA_PATH     = s3://{isName}/ducklake/{tableName}/
-            # -----------------------------------------------------------------
-            # DuckLake stores files at {DATA_PATH}main/{table_name}/{filename}.
-            # DATA_PATH = s3://{isName}/ducklake/  (isName = part before __ in table name)
             parts = table_name.split("__", 1)
             data_path = f"s3://{parts[0]}/ducklake/main/{table_name}/" if parts else ""
 
@@ -256,19 +265,10 @@ def main() -> None:
                     file_size_in_bytes=file_size,
                 ))
 
-            # -----------------------------------------------------------------
-            # 2. Schema from DuckDB DESCRIBE — DuckDB reads S3 via its own
-            #    secret; Python never touches S3 for this step.
-            # -----------------------------------------------------------------
             columns = conn.execute(f'DESCRIBE ducklake.main."{table_name}"').fetchall()
 
-            # -----------------------------------------------------------------
-            # 3. Load existing table (idempotent) or create it fresh.
-            #    Never drop — preserves Iceberg history and stable field IDs.
-            # -----------------------------------------------------------------
             try:
                 tbl = catalog.load_table((ns, table_name))
-                # Validate schema: warn on drift but don't abort
                 duckdb_cols = {col[0] for col in columns}
                 iceberg_cols = {f.name for f in tbl.schema().fields}
                 new_cols = duckdb_cols - iceberg_cols
@@ -286,9 +286,6 @@ def main() -> None:
                 )
                 print(f"[export] {table_name}: created Iceberg table")
 
-            # -----------------------------------------------------------------
-            # 4. Duplicate protection — skip files already in current snapshot.
-            # -----------------------------------------------------------------
             existing_paths: set[str] = set()
             if tbl.current_snapshot() is not None:
                 for task in tbl.scan().plan_files():
@@ -304,11 +301,6 @@ def main() -> None:
             if skipped:
                 print(f"[export] {table_name}: skipping {skipped} already-registered file(s)")
 
-            # -----------------------------------------------------------------
-            # 5. Register new files via metadata manipulation only.
-            #    fast_append writes a manifest (small S3 write); never reads
-            #    the Parquet data files.
-            # -----------------------------------------------------------------
             with tbl.transaction() as tx:
                 with tx.update_snapshot().fast_append() as append:
                     for df in new_files:

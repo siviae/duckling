@@ -5,8 +5,6 @@ plugins {
 
 val kafkaVersion        = "3.7.0"
 val duckdbVersion       = "1.5.1.0"
-val apicurioVersion     = "2.5.0.Final"
-val avroVersion         = "1.11.3"
 val jacksonVersion      = "2.17.0"
 val coroutinesVersion   = "1.8.0"
 val micrometerVersion   = "1.12.0"
@@ -18,14 +16,10 @@ dependencies {
     // Kafka
     implementation("org.apache.kafka:kafka-clients:$kafkaVersion")
 
-    // Apicurio Avro serde (brings in avro transitively; pin to be explicit)
-    implementation("io.apicurio:apicurio-registry-serdes-avro-serde:$apicurioVersion")
-    implementation("org.apache.avro:avro:$avroVersion")
-
     // DuckDB JDBC
     implementation("org.duckdb:duckdb_jdbc:$duckdbVersion")
 
-    // Jackson YAML
+    // Jackson YAML + JSON (jackson-dataformat-yaml brings in jackson-core/databind transitively)
     implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:$jacksonVersion")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:$jacksonVersion")
 

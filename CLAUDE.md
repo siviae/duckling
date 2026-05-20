@@ -2,20 +2,36 @@
 
 ## What This Is
 
-**Duckling** is a Kafka-to-DuckLake landing pipeline. It reads Avro messages from Kafka topics, accumulates them into micro-batches, and writes Parquet files to DuckLake (Postgres catalog + S3 storage). A separate exporter registers those Parquet files with an Iceberg REST catalog (Lakekeeper) via pure metadata manipulation — no data is re-read.
+**Duckling** is a Kafka-to-DuckLake landing pipeline. It reads plain JSON messages from Kafka topics, accumulates them into micro-batches, and writes Parquet files to DuckLake (Postgres catalog + S3 storage). A separate exporter registers those Parquet files with an Iceberg REST catalog (Lakekeeper) via pure metadata manipulation — no data is re-read.
 
 ```
-Kafka (Avro) → [Duckling: validate → batch → flush] → DuckLake (Parquet/S3)
+Kafka (JSON) → [Duckling: validate → batch → flush] → DuckLake (Parquet/S3)
                                                             ↓ (Exporter)
                                                         Iceberg (Lakekeeper REST catalog)
 ```
+
+## Message Format
+
+Kafka messages are plain UTF-8 JSON objects — no magic byte prefix, no schema ID header.
+
+```json
+{"order_id": "abc-123", "amount": 42.5, "region": "eu-west-1"}
+```
+
+`KafkaSource` uses `StringDeserializer` and parses each message with Jackson `ObjectMapper` into `Map<String, Any?>`.
+
+Schema is registered in Apicurio as a **JSON Schema** (draft-07) artifact (type `JSON`). It is used to:
+- derive DuckLake column types: `string`→VARCHAR, `number`→DOUBLE, `integer`→BIGINT, `boolean`→BOOLEAN
+- enforce BACKWARD compatibility on schema evolution
+
+Fields absent from `"required"` are nullable. The union type `["T", "null"]` is also nullable.
 
 ## Architecture
 
 - **One coroutine per Kafka topic** under a `SupervisorJob` — failures are isolated per topic
 - **Three flush triggers** (whichever fires first): time elapsed, offset progress (lag %), bytes accumulated
 - **Adaptive memory controller** (`AdaptiveController.kt`): dynamically computes per-topic batch size budget from JVM heap, number of active topics, and EMA throughput — prevents OOM
-- **Schema governance via Apicurio**: BACKWARD-compatible Avro schemas, fetched and applied before each flush; schema changes trigger ALTER TABLE DDL
+- **Schema governance via Apicurio**: BACKWARD-compatible JSON Schemas, fetched and applied before each flush; schema changes trigger ALTER TABLE DDL
 - **Exporter — metadata only**: reads file paths/counts from `ducklake_data_file` in Postgres, calls PyIceberg `fast_append` to register files in Lakekeeper. Never reads Parquet data.
 
 ## Module Layout
@@ -29,8 +45,8 @@ duckling-landing/src/main/kotlin/io/company/duckling/
 │   ├── Config.kt            # YAML data classes
 │   └── ConfigLoader.kt      # Jackson YAML parser
 ├── source/
-│   ├── KafkaSource.kt       # KafkaConsumer wrapper: poll, watermarks, commitSync
-│   └── SchemaValidator.kt   # Apicurio fetch, Avro→DuckDB type mapping, validation rules
+│   ├── KafkaSource.kt       # KafkaConsumer wrapper: poll (parses JSON→Map), watermarks, commitSync
+│   └── SchemaValidator.kt   # Apicurio fetch, JSON Schema→DuckDB type mapping, validation rules
 └── sink/
     ├── DuckLakeWriter.kt    # DuckDB JDBC: attach DuckLake catalog, staged batch inserts
     └── SchemaEvolution.kt   # ALTER TABLE DDL: add columns, widen BIGINT→DOUBLE; blocks non-widening changes
@@ -51,8 +67,8 @@ integration_test/
 | Build | Gradle (Kotlin DSL), fat JAR via `tasks.jar` |
 | Async | Kotlin Coroutines 1.8.0 |
 | Kafka | kafka-clients 3.7.0 |
-| Schema Registry | Apicurio 2.5.0.Final (BACKWARD compat, v2 API) |
-| Serialization | Avro 1.11.3 |
+| Schema Registry | Apicurio 2.5.0.Final (JSON Schema, BACKWARD compat, v2 API) |
+| Serialization | JSON (UTF-8), parsed by Jackson ObjectMapper |
 | Data engine | DuckDB JDBC 1.5.1.0 (in-process, in-memory) |
 | Storage (local) | Garage v1.0.1 (S3-compatible), region = `garage` |
 | Catalog | DuckLake 1.5.x extension (Postgres catalog, S3 Parquet storage) |
@@ -65,7 +81,6 @@ integration_test/
 
 ```bash
 docker compose up -d
-# Then run integration test:
 cd integration_test
 uv run pytest test_landing_to_iceberg.py -s
 ```
@@ -92,7 +107,7 @@ val kafkaContext = kafkaExecutor.asCoroutineDispatcher()
 // Producer loop runs on kafkaContext
 val producer = launch(kafkaContext) { while (isActive) { source.poll(...) } }
 
-// Watermark/offset checks also use kafkaContext (withContext switches to same thread)
+// Watermark/offset checks also use kafkaContext
 val watermarks = withContext(kafkaContext) { source.highWatermarks() }
 withContext(kafkaContext) { source.commitSync() }
 
@@ -101,6 +116,54 @@ withContext(Dispatchers.IO) { writer.writeBatch(batch, currentSchema.columns) }
 ```
 
 The producer coroutine calls `yield()` after each `poll()` so that `withContext(kafkaContext)` calls from the consumer loop can be scheduled on the same thread.
+
+## KafkaRecord Type
+
+`KafkaSource.poll()` returns `List<KafkaRecord>` where:
+
+```kotlin
+data class KafkaRecord(
+    val partition: Int,
+    val offset: Long,
+    val value: Map<String, Any?>,
+)
+```
+
+`Pipeline.kt` uses `record.partition`, `record.offset`, `record.value` (no method calls, data class fields). The `batch` is `MutableList<Map<String, Any?>>`.
+
+## JSON Schema in Apicurio
+
+### Registration (artifact type `JSON`)
+
+```http
+POST /apis/registry/v2/groups/{group}/artifacts
+Content-Type: application/json
+X-Registry-ArtifactId: {topic-name}
+X-Registry-ArtifactType: JSON
+
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "order_id": {"type": "string"},
+    "amount":   {"type": "number"},
+    "count":    {"type": "integer"},
+    "active":   {"type": "boolean"},
+    "note":     {"type": ["string", "null"]}
+  },
+  "required": ["order_id", "amount"]
+}
+```
+
+### Type mapping (SchemaValidator.kt)
+
+| JSON Schema type | DuckDB type | Nullable |
+|-----------------|-------------|---------|
+| `"string"` | VARCHAR | if not in `required` |
+| `"number"` | DOUBLE | if not in `required` |
+| `"integer"` | BIGINT | if not in `required` |
+| `"boolean"` | BOOLEAN | if not in `required` |
+| `["T", "null"]` | (mapped T) | always nullable |
 
 ## DuckLake Write Strategy
 
@@ -165,17 +228,6 @@ The `schema_sync.py` utility exists but is **not called by `exporter.py`**. The 
 ### S3 endpoint patch in PyIceberg:
 Lakekeeper returns Docker-internal hostnames in table config that would override `s3.endpoint`. Both `exporter.py` and the integration test patch `RestCatalog._load_file_io` to strip REST signer config (incompatible with Garage) and preserve explicitly-set `s3.endpoint`.
 
-## Apicurio Wire Format
-
-Apicurio v2 wire format (used by `AvroKafkaDeserializer`):
-```
-0x00           (1 byte  magic)
-id             (8 bytes big-endian long — global artifact ID)
-avro payload   (schemaless Avro binary)
-```
-
-`SchemaValidator` fetches the BACKWARD compatibility rule at the artifact level, falling back to the global rule. If neither is set (HTTP 404), the mode is `NONE` and validation fails.
-
 ## Garage S3 (local dev only)
 
 Garage is used as a local S3-compatible object store for development and testing. It is not part of the production stack.
@@ -188,7 +240,7 @@ Garage requires key IDs in format: `GK` + 24 hex chars (12 bytes).
 - **Endpoint** (internal/Docker): `http://garage:3900`
 - **Endpoint** (host): `http://localhost:3900`
 
-**IMPORTANT**: Garage rejects key IDs that don't start with `GK`. The old key `duckling-local-key-id-00000001` is invalid. The `garage-init` service in `docker-compose.yml` correctly uses the `GK`-prefixed key.
+**IMPORTANT**: Garage rejects key IDs that don't start with `GK`. The `garage-init` service in `docker-compose.yml` correctly uses the `GK`-prefixed key.
 
 ### Garage Admin Commands
 
@@ -226,13 +278,13 @@ Test flow:
 2. Setup Lakekeeper (project + warehouse) — idempotent
 3. Smoke-test Iceberg catalog (write 1 row, read back, drop)
 4. Reset state: write unique `duckling.yaml`, stop duckling, drop all `ducklake_*` Postgres tables, create fresh Kafka topic, restart duckling
-5. Register Avro schema in Apicurio
-6. Produce 1,000,000 records (~1 KB each, ~1 GB total)
+5. Register JSON Schema in Apicurio (`X-Registry-ArtifactType: JSON`)
+6. Produce 1,000,000 plain JSON records (`json.dumps(record).encode("utf-8")`)
 7. Wait for Duckling to flush all records to DuckLake (`_wait_for_ducklake_stable` polls `ducklake_data_file.record_count`)
 8. Run exporter via `docker compose run --rm exporter`
 9. Count Iceberg records via PyIceberg → assert == 1,000,000
 
-Each test run uses a unique `RUN_SUFFIX` (UUID hex) so topic and table names never collide with previous runs. Old tables accumulate but don't interfere.
+Each test run uses a unique `RUN_SUFFIX` (UUID hex) so topic and table names never collide with previous runs.
 
 ## Configuration
 
@@ -264,23 +316,23 @@ Key per-topic settings:
 ## Known Issues / Remaining Work
 
 ### 1. `schema_sync.py` is not wired into the exporter
-`duckling-exporter/schema_sync.py` implements Avro→Iceberg schema evolution (add columns, widen types) but `exporter.py` never imports or calls it. When an existing Iceberg table has schema drift vs. the DuckLake table, the exporter logs a warning and proceeds — new files may have columns not in the Iceberg schema (readers will null-fill them). This is harmless for reading but the Iceberg schema will drift from the actual data schema over time.
+`duckling-exporter/schema_sync.py` implements Avro→Iceberg schema evolution but needs updating for JSON Schema, and `exporter.py` never calls it. When an existing Iceberg table has schema drift vs. DuckLake, the exporter logs a warning and proceeds without applying DDL.
 
-**Fix**: call `sync_iceberg_schema()` from `schema_sync.py` in `exporter.py` after loading an existing table, before `fast_append`.
+**Fix**: update `schema_sync.py` for JSON Schema format; call `sync_iceberg_schema()` in `exporter.py` after loading an existing table, before `fast_append`.
 
 ### 2. `KafkaSource.highWatermarks()` and `currentOffsets()` both call `partitionsFor()` separately
-In `KafkaSource.kt`, both methods call `consumer.partitionsFor(topic)` independently — two broker round-trips when one would suffice.
+Both methods call `consumer.partitionsFor(topic)` independently — two broker round-trips when one would suffice.
 
 **Fix** (minor optimization, not a correctness issue): combine into a single method that returns both maps.
 
 ### 3. `DuckLakeWriter.ensureTable()` is called twice at pipeline startup
-`Pipeline.kt` calls `writer.ensureTable(initialSchema.columns)` at init time, and then calls it again on every flush. The first call is harmless (CREATE TABLE IF NOT EXISTS) but redundant with the flush path.
+`Pipeline.kt` calls `writer.ensureTable(initialSchema.columns)` at init time, and then again on every flush. The first call is harmless (CREATE TABLE IF NOT EXISTS) but redundant.
 
 ### 4. Exporter data path reconstruction assumes `{isName}__` prefix
-`exporter.py` splits `table_name` on `__` to derive `isName` for the S3 `data_path`. If a DuckLake table name does not contain `__`, `data_path` will be empty and relative file paths won't be resolved. This matches Duckling's naming convention but could break if tables are created by other means.
+`exporter.py` splits `table_name` on `__` to derive `isName` for the S3 `data_path`. If a DuckLake table name does not contain `__`, relative file paths won't be resolved.
 
 ### 5. `_wait_for_ducklake_stable` only counts S3 Parquet files
-The test waits on `ducklake_data_file.record_count`. This is correct for the current setup because `DATA_INLINING_ROW_LIMIT 0` is configured. If inlining is ever re-enabled, the test will wait forever on a fully-inlined table.
+The test waits on `ducklake_data_file.record_count`. This is correct for the current setup because `DATA_INLINING_ROW_LIMIT 0` is configured. If inlining is ever re-enabled, the test will wait forever.
 
 ## DuckLake Inspection
 

@@ -1,14 +1,33 @@
 package io.company.duckling.source
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import org.apache.avro.Schema
+import org.slf4j.LoggerFactory
 
 /**
- * Fetches and validates Avro schemas from Apicurio Registry.
- * Enforces BACKWARD compatibility mode and flat type rules.
+ * Fetches and validates JSON Schemas from Apicurio Registry.
+ * Enforces BACKWARD compatibility mode and maps JSON Schema types to DuckDB types.
+ *
+ * Expected JSON Schema format:
+ * {
+ *   "$schema": "http://json-schema.org/draft-07/schema#",
+ *   "type": "object",
+ *   "properties": {
+ *     "field_name": { "type": "string" },
+ *     "amount":     { "type": "number" },
+ *     "count":      { "type": "integer" },
+ *     "active":     { "type": "boolean" },
+ *     "nullable":   { "type": ["string", "null"] }
+ *   },
+ *   "required": ["field_name", "amount"]
+ * }
+ *
+ * Type mapping: string→VARCHAR, number→DOUBLE, integer→BIGINT, boolean→BOOLEAN.
+ * Fields absent from "required" are nullable. Union ["T","null"] is also nullable.
  */
 class SchemaValidator(private val registryUrl: String) {
 
+    private val log = LoggerFactory.getLogger(SchemaValidator::class.java)
     private val http = java.net.http.HttpClient.newHttpClient()
     private val json = ObjectMapper()
 
@@ -24,15 +43,12 @@ class SchemaValidator(private val registryUrl: String) {
         "constraint", "view", "database", "schema", "use", "show", "describe"
     )
 
-    data class ValidatedSchema(
-        val avroSchema: Schema,
-        val columns: List<ColumnDef>
-    )
+    data class ValidatedSchema(val columns: List<ColumnDef>)
 
     data class ColumnDef(
         val name: String,
         val duckType: String,
-        val nullable: Boolean
+        val nullable: Boolean,
     )
 
     fun fetchAndValidate(groupId: String, artifactId: String): ValidatedSchema {
@@ -42,20 +58,56 @@ class SchemaValidator(private val registryUrl: String) {
         }
 
         val schemaJson = fetchLatestSchema(groupId, artifactId)
-        val schema = Schema.Parser().parse(schemaJson)
-
-        return ValidatedSchema(schema, extractColumns(schema))
+        val root = json.readTree(schemaJson)
+        return ValidatedSchema(extractColumns(root))
     }
 
-    fun extractColumns(schema: Schema): List<ColumnDef> {
-        require(schema.type == Schema.Type.RECORD) { "Top-level schema must be RECORD, got ${schema.type}" }
+    fun extractColumns(root: JsonNode): List<ColumnDef> {
+        val properties = root.get("properties")
+            ?: error("JSON Schema missing 'properties' object")
+        val required = root.get("required")
+            ?.map { it.asText() }
+            ?.toSet()
+            ?: emptySet()
 
-        return schema.fields.map { field ->
-            val name = field.name()
+        return properties.fields().asSequence().map { (name, fieldNode) ->
             validateFieldName(name)
-            val (duckType, nullable) = mapAvroType(field.schema(), field.name())
-            ColumnDef(name, duckType, nullable)
+            mapField(name, fieldNode, name in required)
+        }.toList()
+    }
+
+    private fun mapField(name: String, node: JsonNode, required: Boolean): ColumnDef {
+        val typeNode = node.get("type")
+            ?: error("Field '$name' has no 'type' in JSON Schema")
+
+        return when {
+            typeNode.isArray -> {
+                // e.g. ["string", "null"] or ["null", "string"]
+                val types = typeNode.map { it.asText() }
+                val nonNull = types.filter { it != "null" }
+                require(nonNull.size == 1) {
+                    "Field '$name' has union with multiple non-null types: $types"
+                }
+                ColumnDef(name, scalarToDuck(nonNull[0], name), nullable = true)
+            }
+            typeNode.isTextual -> {
+                ColumnDef(name, scalarToDuck(typeNode.asText(), name), nullable = !required)
+            }
+            else -> error("Field '$name' has unsupported type node: $typeNode")
         }
+    }
+
+    private fun scalarToDuck(type: String, fieldName: String): String = when (type) {
+        "string"  -> "VARCHAR"
+        "number"  -> "DOUBLE"
+        "integer" -> "BIGINT"
+        "boolean" -> "BOOLEAN"
+        // Nested types: store as JSON strings — no lossless DuckDB column type equivalent
+        "object", "array" -> {
+            log.warn("Field '$fieldName' has complex type '$type', mapping to VARCHAR")
+            "VARCHAR"
+        }
+        else -> error("Field '$fieldName' has unsupported JSON Schema type '$type'")
     }
 
     private fun validateFieldName(name: String) {
@@ -65,38 +117,6 @@ class SchemaValidator(private val registryUrl: String) {
         require(name.lowercase() !in duckdbReserved) {
             "Field name '$name' is a DuckDB reserved keyword"
         }
-    }
-
-    private fun mapAvroType(schema: Schema, fieldName: String): Pair<String, Boolean> {
-        return when (schema.type) {
-            Schema.Type.STRING -> Pair("VARCHAR", false)
-            Schema.Type.INT -> Pair("BIGINT", false)
-            Schema.Type.LONG -> Pair("BIGINT", false)
-            Schema.Type.FLOAT -> Pair("DOUBLE", false)
-            Schema.Type.DOUBLE -> Pair("DOUBLE", false)
-            Schema.Type.BOOLEAN -> Pair("BOOLEAN", false)
-            Schema.Type.NULL -> Pair("VARCHAR", true) // null-only field → nullable VARCHAR
-            Schema.Type.UNION -> mapUnionType(schema, fieldName)
-            Schema.Type.RECORD, Schema.Type.ARRAY, Schema.Type.MAP ->
-                error("Field '$fieldName' has forbidden type ${schema.type} (nested objects/arrays/maps not allowed)")
-
-            else -> error("Field '$fieldName' has unsupported Avro type ${schema.type}")
-        }
-    }
-
-    private fun mapUnionType(schema: Schema, fieldName: String): Pair<String, Boolean> {
-        val types = schema.types
-        val nonNull = types.filter { it.type != Schema.Type.NULL }
-
-        require(nonNull.size == 1) {
-            "Field '$fieldName' has union with multiple non-null types: $nonNull"
-        }
-        require(types.any { it.type == Schema.Type.NULL }) {
-            "Field '$fieldName' has union without null — only union[null, T] is supported"
-        }
-
-        val (duckType, _) = mapAvroType(nonNull[0], fieldName)
-        return Pair(duckType, true)
     }
 
     private fun fetchCompatibilityMode(groupId: String, artifactId: String): String {

@@ -1,9 +1,9 @@
 # Duckling
 
-Duckling — пайплайн приземления данных из Kafka в Iceberg. Читает Avro-сообщения из Kafka-топиков, накапливает их в микро-батчи и записывает Parquet-файлы в DuckLake (каталог на Postgres + хранилище в S3). Отдельный экспортёр регистрирует эти файлы в REST-каталоге Iceberg (Lakekeeper) через чистую манипуляцию метаданными — без повторного чтения данных.
+Duckling — пайплайн приземления данных из Kafka в Iceberg. Читает JSON-сообщения из Kafka-топиков, накапливает их в микро-батчи и записывает Parquet-файлы в DuckLake (каталог на Postgres + хранилище в S3). Отдельный экспортёр регистрирует эти файлы в REST-каталоге Iceberg (Lakekeeper) через чистую манипуляцию метаданными — без повторного чтения данных.
 
 ```
-Kafka (Avro)
+Kafka (JSON)
     ↓
 Duckling (Kotlin)
     валидация → батч → flush
@@ -16,6 +16,34 @@ Exporter (Python)
 Iceberg (Lakekeeper REST catalog + S3)
 ```
 
+## Формат сообщений
+
+Kafka-сообщения — обычный UTF-8 JSON. Никакого бинарного заголовка, никакого магического байта.
+
+```json
+{"order_id": "abc-123", "amount": 42.5, "region": "eu-west-1"}
+```
+
+Схема регистрируется в Apicurio в формате **JSON Schema** (draft-07) и используется для:
+- определения типов колонок DuckLake (`string`→VARCHAR, `number`→DOUBLE, `integer`→BIGINT, `boolean`→BOOLEAN);
+- контроля совместимости при эволюции схемы (режим BACKWARD).
+
+Пример JSON Schema:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "order_id": {"type": "string"},
+    "amount":   {"type": "number"},
+    "region":   {"type": "string"}
+  },
+  "required": ["order_id", "amount", "region"]
+}
+```
+
+Поля, не перечисленные в `"required"`, становятся nullable-колонками. Тип `["string", "null"]` тоже трактуется как nullable.
+
 ## Архитектура
 
 **Одна корутина на Kafka-топик** под `SupervisorJob` — сбой в одном топике не затрагивает остальные.
@@ -27,7 +55,7 @@ Iceberg (Lakekeeper REST catalog + S3)
 
 **Адаптивный контроллер памяти** (`AdaptiveController.kt`): делит JVM-хип поровну между активными топиками и корректирует батч-бюджет и интервал flush через EMA-оценку пропускной способности. Предотвращает OOM при большом числе одновременно активных топиков.
 
-**Управление схемами через Apicurio**: перед каждым flush загружается актуальная Avro-схема с BACKWARD-совместимостью. Изменения схемы вызывают `ALTER TABLE` DDL на таблице DuckLake. Несовместимые изменения типов останавливают топик.
+**Управление схемами через Apicurio**: перед каждым flush загружается актуальная JSON Schema с BACKWARD-совместимостью. Изменения схемы вызывают `ALTER TABLE` DDL на таблице DuckLake. Несовместимые изменения типов останавливают топик.
 
 **Экспортёр — только метаданные**: читает пути к файлам и количество записей напрямую из Postgres-каталога DuckLake (`ducklake_data_file`), затем вызывает PyIceberg `fast_append` для регистрации файлов в Lakekeeper. Parquet-файлы экспортёр не читает никогда.
 
@@ -42,15 +70,15 @@ duckling-landing/src/main/kotlin/io/company/duckling/
 │   ├── Config.kt            # Data-классы конфигурации
 │   └── ConfigLoader.kt      # Парсер YAML на Jackson
 ├── source/
-│   ├── KafkaSource.kt       # Обёртка KafkaConsumer: poll, watermarks, commitSync
-│   └── SchemaValidator.kt   # Загрузка схем из Apicurio, маппинг Avro→DuckDB, правила валидации
+│   ├── KafkaSource.kt       # Обёртка KafkaConsumer: poll (парсит JSON→Map), watermarks, commitSync
+│   └── SchemaValidator.kt   # Загрузка JSON Schema из Apicurio, маппинг типов, правила валидации
 └── sink/
     ├── DuckLakeWriter.kt    # DuckDB JDBC: ATTACH DuckLake, staged batch inserts
     └── SchemaEvolution.kt   # ALTER TABLE DDL: добавление колонок, расширение BIGINT→DOUBLE
 
 duckling-exporter/
 ├── exporter.py              # Читает метаданные из Postgres DuckLake, регистрирует файлы в Iceberg
-└── schema_sync.py           # Утилита: синхронизация схемы Iceberg из Apicurio Avro
+└── schema_sync.py           # Утилита: синхронизация схемы Iceberg из Apicurio JSON Schema
 
 integration_test/
 └── test_landing_to_iceberg.py  # End-to-end pytest: Kafka → DuckLake → Iceberg
@@ -64,8 +92,8 @@ integration_test/
 | Сборка | Gradle (Kotlin DSL), fat JAR |
 | Async | Kotlin Coroutines 1.8.0 |
 | Kafka | kafka-clients 3.7.0 |
-| Реестр схем | Apicurio 2.5.0 (BACKWARD compat, v2 API) |
-| Сериализация | Avro 1.11.3 |
+| Реестр схем | Apicurio 2.5.0 (JSON Schema, BACKWARD compat, v2 API) |
+| Сериализация | JSON (UTF-8) |
 | Движок данных | DuckDB JDBC 1.5.1.0 (in-process, in-memory) |
 | Хранилище | S3-совместимое объектное хранилище |
 | Каталог | DuckLake 1.5.x (каталог Postgres + Parquet в S3) |

@@ -374,7 +374,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "confluent-kafka" },
     { name = "duckdb" },
-    { name = "fastavro" },
     { name = "numpy" },
     { name = "psycopg2-binary" },
     { name = "pyarrow" },
@@ -387,33 +386,12 @@ dependencies = [
 requires-dist = [
     { name = "confluent-kafka", specifier = "==2.3.0" },
     { name = "duckdb", specifier = ">=1.5.1" },
-    { name = "fastavro", specifier = "==1.9.4" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "psycopg2-binary", specifier = "==2.9.9" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "pyiceberg", extras = ["s3fs"], specifier = ">=0.9.0" },
     { name = "pytest", specifier = "==8.2.0" },
     { name = "requests", specifier = "==2.31.0" },
-]
-
-[[package]]
-name = "fastavro"
-version = "1.9.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/90/92/c6b038c0a00230906810e665ed787cb5ec975ef339630cb03fbd8d667a6a/fastavro-1.9.4.tar.gz", hash = "sha256:56b8363e360a1256c94562393dc7f8611f3baf2b3159f64fb2b9c6b87b14e876", size = 985933, upload-time = "2024-02-13T19:14:34.193Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/35/ed6a09aa1bcaf3cf49f158ff6b7fa91cabe070f10e5d4f0618af8614c8c0/fastavro-1.9.4-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:af8c6d8c43a02b5569c093fc5467469541ac408c79c36a5b0900d3dd0b3ba838", size = 1090637, upload-time = "2024-02-13T19:15:08.218Z" },
-    { url = "https://files.pythonhosted.org/packages/75/65/3948dd27dd38169437376e1017ccaa423094d4b52b6b8aae26700273b161/fastavro-1.9.4-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e4a138710bd61580324d23bc5e3df01f0b82aee0a76404d5dddae73d9e4c723f", size = 3301632, upload-time = "2024-02-13T19:15:14.489Z" },
-    { url = "https://files.pythonhosted.org/packages/bb/f1/0b2f1ef950e948f8eab7bcf6fcbbccdfcd5468cf269c1133b3bd02648a1f/fastavro-1.9.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:903d97418120ca6b6a7f38a731166c1ccc2c4344ee5e0470d09eb1dc3687540a", size = 3332880, upload-time = "2024-02-13T19:15:21.878Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/94/871f19fd0885228b9698c40cf79a3a3fe9d231ec36c1fa99e1db10f6d3f4/fastavro-1.9.4-cp311-cp311-musllinux_1_1_aarch64.whl", hash = "sha256:c443eeb99899d062dbf78c525e4614dd77e041a7688fa2710c224f4033f193ae", size = 3312646, upload-time = "2024-02-13T19:15:28.211Z" },
-    { url = "https://files.pythonhosted.org/packages/ba/73/e64ed287a8786731ea00f83e4fb1d863f7932eb5ca8ac388e150a4780339/fastavro-1.9.4-cp311-cp311-musllinux_1_1_x86_64.whl", hash = "sha256:ac26ab0774d1b2b7af6d8f4300ad20bbc4b5469e658a02931ad13ce23635152f", size = 3355161, upload-time = "2024-02-13T19:15:34.323Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/7e/18d9b5c3e1621f58c1f4bee67ec1e4dd8ce8287e70c97262088a5673145c/fastavro-1.9.4-cp311-cp311-win_amd64.whl", hash = "sha256:cf7247874c22be856ba7d1f46a0f6e0379a6025f1a48a7da640444cbac6f570b", size = 499413, upload-time = "2024-02-13T19:15:37.204Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/fb/e9d780d1ce74ff407c58b9427e39dca0bc1157c7ac4d2bf97291466e67e4/fastavro-1.9.4-cp312-cp312-macosx_10_9_universal2.whl", hash = "sha256:68912f2020e1b3d70557260b27dd85fb49a4fc6bfab18d384926127452c1da4c", size = 1069338, upload-time = "2024-02-13T19:15:41.516Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/ca/3e93282feb21da7525935f042c35c3dd709f0ce168e46f84b58f109db84c/fastavro-1.9.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6925ce137cdd78e109abdb0bc33aad55de6c9f2d2d3036b65453128f2f5f5b92", size = 3268683, upload-time = "2024-02-13T19:15:48.557Z" },
-    { url = "https://files.pythonhosted.org/packages/03/d1/b1841585269d3afa8e29bc5ea06a9c15dae09ce287f803f64ea6e446ccc7/fastavro-1.9.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8b928cd294e36e35516d0deb9e104b45be922ba06940794260a4e5dbed6c192a", size = 3330467, upload-time = "2024-02-13T19:15:56.138Z" },
-    { url = "https://files.pythonhosted.org/packages/94/7c/c9c60190f7ea1d1f3ada4ed205daf526cf1c8f7e19bd61d62db1c68f94d7/fastavro-1.9.4-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:90c9838bc4c991ffff5dd9d88a0cc0030f938b3fdf038cdf6babde144b920246", size = 3253758, upload-time = "2024-02-13T19:16:02.458Z" },
-    { url = "https://files.pythonhosted.org/packages/1d/ae/f6f360a917d146b75b9da2f3c83ae29c562dcf3ba140f5a376461383fd0b/fastavro-1.9.4-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:eca6e54da571b06a3c5a72dbb7212073f56c92a6fbfbf847b91c347510f8a426", size = 3320856, upload-time = "2024-02-13T19:16:09.696Z" },
-    { url = "https://files.pythonhosted.org/packages/77/1c/9a22bfde3308535510bf5ecff1633d7c0f5d603e8d8f0b28c1e86439e26e/fastavro-1.9.4-cp312-cp312-win_amd64.whl", hash = "sha256:a4b02839ac261100cefca2e2ad04cdfedc556cb66b5ec735e0db428e74b399de", size = 487365, upload-time = "2024-02-13T19:16:13.29Z" },
 ]
 
 [[package]]

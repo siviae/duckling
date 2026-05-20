@@ -137,6 +137,7 @@ services:
       ICEBERG_WAREHOUSE: landing
     volumes:
       - ./duckling-exporter:/opt/duckling-exporter
+      - uv_cache:/root/.cache/uv
     depends_on:
       - garage
       - lakekeeper
@@ -147,3 +148,4 @@ volumes:
   postgres_data:
   garage_meta:
   garage_data:
+  uv_cache:

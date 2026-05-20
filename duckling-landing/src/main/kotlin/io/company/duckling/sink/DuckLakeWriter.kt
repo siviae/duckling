@@ -1,13 +1,12 @@
 package io.company.duckling.sink
 
 import io.company.duckling.source.SchemaValidator.ColumnDef
-import org.apache.avro.generic.GenericRecord
 import java.sql.Connection
 import java.sql.DriverManager
 
 /**
- * Manages one DuckDB connection per topic. Writes batches of Avro GenericRecords
- * to DuckLake (Postgres catalog + MinIO Parquet files).
+ * Manages one DuckDB connection per topic. Writes batches of JSON records
+ * (represented as Map<String, Any?>) to DuckLake (Postgres catalog + S3 Parquet files).
  *
  * DuckLake attach string format:
  *   ducklake:postgres://<host>/<db>?user=...&password=...
@@ -75,8 +74,8 @@ class DuckLakeWriter(
         }
     }
 
-    /** Writes a batch of records. Columns are derived from the validated schema. */
-    fun writeBatch(records: List<GenericRecord>, columns: List<ColumnDef>) {
+    /** Writes a batch of JSON records. Columns are derived from the validated schema. */
+    fun writeBatch(records: List<Map<String, Any?>>, columns: List<ColumnDef>) {
         if (records.isEmpty()) return
 
         val colNames = columns.joinToString(", ") { it.name }
@@ -97,7 +96,7 @@ class DuckLakeWriter(
             conn.prepareStatement("INSERT INTO $tempTable ($colNames) VALUES ($placeholders)").use { ps ->
                 for (record in records) {
                     for ((i, col) in columns.withIndex()) {
-                        val value = record.get(col.name)
+                        val value = record[col.name]
                         validateValue(col, value)
                         ps.setObject(i + 1, value)
                     }

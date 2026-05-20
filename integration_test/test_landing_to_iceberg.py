@@ -1,22 +1,34 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "confluent-kafka==2.3.0",
+#     "psycopg2-binary==2.9.9",
+#     "pyiceberg[s3fs]>=0.9.0",
+#     "requests==2.31.0",
+#     "pytest==8.2.0",
+#     "pyarrow>=23.0.1",
+#     "numpy>=2.4.4",
+# ]
+# ///
 """
 Integration test: Kafka → Duckling → DuckLake → Exporter → Iceberg
 
 Prerequisites: `docker compose up -d` is running from the project root.
 
 Run:
-    cd integration_test
-    uv run pytest test_landing_to_iceberg.py -s
+    ./integration_test/test_landing_to_iceberg.py
+    uv run integration_test/test_landing_to_iceberg.py
 """
-import io
+import json
 import os
-import struct
 import subprocess
+import sys
 import textwrap
 import time
 import uuid
 import random
 
-import fastavro
 import psycopg2
 import pyarrow as pa
 import pytest
@@ -74,21 +86,21 @@ ARTIFACT  = TOPIC                    # Apicurio artifact id matches Kafka topic 
 DUCKLAKE_TABLE = f"test__orders_{RUN_SUFFIX}"
 ICEBERG_TABLE  = f"landing.{DUCKLAKE_TABLE}"
 
-# How many records to produce (≈1 KB each → ~10 MB total)
-#RECORD_COUNT = 1_000_000
-RECORD_COUNT = 10_000
+# How many records to produce (override with --count or RECORD_COUNT env var)
+RECORD_COUNT = int(os.environ.get("RECORD_COUNT", "10000"))
 
-# Avro schema registered in Apicurio
-AVRO_SCHEMA = {
-    "type": "record",
-    "name": "Order",
-    "namespace": "test",
-    "fields": [
-        {"name": "order_id", "type": "string"},
-        {"name": "amount",   "type": "double"},
-        {"name": "region",   "type": "string"},
-        {"name": "payload",  "type": "string"},
-    ],
+# JSON Schema registered in Apicurio — defines field types for DuckLake column mapping
+JSON_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+        "order_id": {"type": "string"},
+        "amount":   {"type": "number"},
+        "region":   {"type": "string"},
+        "payload":  {"type": "string"},
+    },
+    "required": ["order_id", "amount", "region", "payload"],
+    "additionalProperties": False,
 }
 
 REGIONS = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
@@ -103,6 +115,41 @@ def _compose_run(*cmd) -> subprocess.CompletedProcess:
     cwd = os.path.join(os.path.dirname(__file__), "..")
     args = ["docker", "compose", "run", "--rm"] + list(cmd)
     return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def _start_services() -> None:
+    """Starts core services (kafka, postgres, garage, apicurio, duckling).
+    Lakekeeper is started later by _run_lakekeeper_migrate() after the DB migration."""
+    cwd = os.path.join(os.path.dirname(__file__), "..")
+    result = subprocess.run(
+        ["docker", "compose", "up", "-d", "--build",
+         "kafka", "postgres", "garage", "apicurio", "duckling"],
+        capture_output=True, text=True, cwd=cwd,
+    )
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        raise RuntimeError(f"docker compose up failed (rc={result.returncode})")
+    print("Core services started.")
+
+
+def _run_lakekeeper_migrate() -> None:
+    """Runs the Lakekeeper DB migration (idempotent) then starts lakekeeper."""
+    cwd = os.path.join(os.path.dirname(__file__), "..")
+    result = subprocess.run(
+        ["docker", "compose", "run", "--rm", "lakekeeper-migrate"],
+        capture_output=True, text=True, cwd=cwd,
+    )
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        raise RuntimeError(f"lakekeeper-migrate failed (rc={result.returncode})")
+    # Start lakekeeper now that the DB is migrated.
+    subprocess.run(
+        ["docker", "compose", "up", "-d", "lakekeeper"],
+        capture_output=True, text=True, cwd=cwd, check=True,
+    )
+    print("Lakekeeper migration complete.")
 
 
 def _setup_garage() -> None:
@@ -179,19 +226,15 @@ def _verify_iceberg_catalog() -> None:
 
 def _setup_lakekeeper() -> None:
     """Creates Lakekeeper project + warehouse if not already set up."""
-    # Bootstrap warehouse (idempotent)
     r = requests.get(f"{ICEBERG_URL}/catalog/v1/config?warehouse=landing")
     if r.status_code != 200:
-        # Bootstrap (idempotent — ignore errors if already done)
         requests.post(f"{ICEBERG_URL}/management/v1/bootstrap",
                       json={"accept-terms-of-use": True})
 
-        # Create project
         r = requests.post(f"{ICEBERG_URL}/management/v1/project",
                           json={"project-name": "default"})
         project_id = r.json().get("project-id", "00000000-0000-0000-0000-000000000000")
 
-        # Create warehouse pointing to Garage S3 bucket
         requests.post(f"{ICEBERG_URL}/management/v1/warehouse", json={
             "warehouse-name": "landing",
             "project-id": project_id,
@@ -212,7 +255,6 @@ def _setup_lakekeeper() -> None:
             },
         })
 
-        # Move warehouse to the default project so unauthenticated catalog requests resolve it
         pg = psycopg2.connect(POSTGRES_DSN)
         try:
             with pg.cursor() as cur:
@@ -225,14 +267,12 @@ def _setup_lakekeeper() -> None:
     else:
         print("Lakekeeper warehouse already configured.")
 
-    # Ensure 'landing' namespace exists (always — namespace may be missing even if warehouse exists)
     catalog = _build_catalog()
     try:
         catalog.create_namespace("landing")
         print("Created Iceberg namespace 'landing'.")
     except NamespaceAlreadyExistsError:
         print("Iceberg namespace 'landing' already exists.")
-
 
 
 def _write_duckling_config() -> None:
@@ -276,22 +316,14 @@ def _write_duckling_config() -> None:
 
 
 def _reset_test_state() -> None:
-    """Points duckling at a fresh unique topic/table for this run and restarts it.
-
-    Since every run uses a new topic and table name (via RUN_SUFFIX), there is
-    nothing to clean up from previous runs — old tables are simply left in place.
-    """
+    """Points duckling at a fresh unique topic/table for this run and restarts it."""
     cwd = os.path.join(os.path.dirname(__file__), "..")
 
-    # 1. Write duckling.yaml with the unique topic/table for this run.
     _write_duckling_config()
 
-    # 2. Stop duckling so we can restart with the new config.
     subprocess.run(["docker", "compose", "stop", "duckling"], cwd=cwd, check=True)
     print("Duckling stopped.")
 
-    # 3. Drop all DuckLake catalog tables so DuckLake re-initialises on the next ATTACH.
-    #    TRUNCATE leaves empty tables that confuse DuckLake; DROP lets it start fresh.
     pg = psycopg2.connect(POSTGRES_DSN)
     try:
         with pg.cursor() as cur:
@@ -310,7 +342,6 @@ def _reset_test_state() -> None:
     finally:
         pg.close()
 
-    # 4. Create the new Kafka topic (fresh, no old offsets).
     admin = AdminClient({"bootstrap.servers": KAFKA_BROKERS})
     futures = admin.create_topics([NewTopic(TOPIC, num_partitions=1, replication_factor=1,
                                             config={"retention.bytes": str(10 * 1024 * 1024)})])
@@ -321,7 +352,10 @@ def _reset_test_state() -> None:
             print(f"Note (topic create): {e}")
     print(f"Created topic '{TOPIC}'.")
 
-    # 5. Start duckling — fresh consumer pointing at the new topic.
+    # Register schema before starting duckling so it's available on the first fetch attempt.
+    _register_schema()
+    _set_backward_compatibility(IS_GROUP, ARTIFACT)
+
     subprocess.run(["docker", "compose", "start", "duckling"], cwd=cwd, check=True)
     _wait_for_http("http://localhost:9090/metrics", timeout=60)
     print("Duckling started and ready.")
@@ -341,25 +375,24 @@ def _wait_for_http(url: str, timeout: int = 60, interval: int = 3) -> None:
     raise TimeoutError(f"{url} not reachable after {timeout}s")
 
 
-def _register_schema(global_id_if_exists: int | None) -> int:
-    """Registers the Avro schema in Apicurio and returns the global ID."""
+def _register_schema() -> None:
+    """Registers the JSON Schema in Apicurio (idempotent)."""
     url = f"{APICURIO_URL}/groups/{IS_GROUP}/artifacts/{ARTIFACT}"
-    resp = requests.get(url)
-    if resp.status_code == 200:
-        meta = requests.get(f"{url}/meta").json()
-        return meta["globalId"]
+    if requests.get(url).status_code == 200:
+        print(f"    Schema '{ARTIFACT}' already registered.")
+        return
 
     resp = requests.post(
         f"{APICURIO_URL}/groups/{IS_GROUP}/artifacts",
         headers={
-            "Content-Type": "application/vnd.apache.avro+json",
+            "Content-Type": "application/json",
             "X-Registry-ArtifactId": ARTIFACT,
-            "X-Registry-ArtifactType": "AVRO",
+            "X-Registry-ArtifactType": "JSON",
         },
-        json=AVRO_SCHEMA,
+        json=JSON_SCHEMA,
     )
     resp.raise_for_status()
-    return resp.json()["globalId"]
+    print(f"    Schema '{ARTIFACT}' registered (global ID: {resp.json()['globalId']}).")
 
 
 def _set_backward_compatibility(group_id: str, artifact_id: str) -> None:
@@ -370,23 +403,8 @@ def _set_backward_compatibility(group_id: str, artifact_id: str) -> None:
         resp.raise_for_status()
 
 
-
-def _serialize(schema_dict: dict, record: dict, global_id: int) -> bytes:
-    """
-    Apicurio v2 wire format:
-      0x00  (1 byte  magic)
-      id    (8 bytes big-endian long — global artifact ID)
-      avro  (schemaless Avro binary)
-    """
-    parsed = fastavro.parse_schema(schema_dict)
-    buf = io.BytesIO()
-    fastavro.schemaless_writer(buf, parsed, record)
-    avro_bytes = buf.getvalue()
-    return struct.pack(">bq", 0x00, global_id) + avro_bytes
-
-
-def _produce_records(global_id: int, count: int) -> None:
-    """Produces `count` Avro records to the Kafka topic."""
+def _produce_records(count: int) -> None:
+    """Produces `count` plain JSON records to the Kafka topic."""
     producer = Producer({"bootstrap.servers": KAFKA_BROKERS})
     errors = []
 
@@ -403,7 +421,7 @@ def _produce_records(global_id: int, count: int) -> None:
         }
         producer.produce(
             TOPIC,
-            value=_serialize(AVRO_SCHEMA, record, global_id),
+            value=json.dumps(record).encode("utf-8"),
             on_delivery=on_delivery,
         )
         if i % 1000 == 0:
@@ -417,12 +435,7 @@ def _produce_records(global_id: int, count: int) -> None:
 
 def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 300,
                               target_rows: int | None = None) -> int:
-    """Waits until data row count is stable.  Returns the final snapshot_id.
-
-    If target_rows is given, returns as soon as that count is reached (regardless
-    of the stability window).  Otherwise waits for the count to be non-zero and
-    unchanged for stable_for seconds.
-    """
+    """Waits until data row count is stable. Returns the final snapshot_id."""
     pg = psycopg2.connect(POSTGRES_DSN)
     deadline = time.time() + timeout
     last_count = 0
@@ -451,7 +464,6 @@ def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 300,
             now = time.time()
             elapsed = timeout - (deadline - now)
 
-            # Target-based exit: return as soon as all expected rows have landed.
             if target_rows is not None and row_count >= target_rows:
                 print(f"  [{elapsed:.1f}s] DuckLake: data rows={row_count}, snapshot={max_snap} ✓ target reached")
                 return max_snap
@@ -475,6 +487,24 @@ def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 300,
     return max_snap
 
 
+def _prewarm_exporter() -> None:
+    """Installs exporter dependencies into the uv cache without running real work."""
+    cwd = os.path.join(os.path.dirname(__file__), "..")
+    result = subprocess.run(
+        ["docker", "compose", "run", "--rm",
+         "-e", "UV_PREWARM=1",
+         "-e", f"DUCKLAKE_CATALOG_POSTGRES_URL=jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling",
+         "-e", "AWS_ACCESS_KEY_ID=dummy",
+         "-e", "AWS_SECRET_ACCESS_KEY=dummy",
+         "exporter", "run", "exporter.py"],
+        capture_output=True, text=True, cwd=cwd,
+    )
+    if result.returncode != 0:
+        print(result.stderr[-1000:])
+        raise RuntimeError(f"Exporter prewarm failed (rc={result.returncode})")
+    print("Exporter dependencies prewarmed.")
+
+
 def _run_exporter() -> None:
     """Runs the exporter as a one-off container via docker compose run --rm."""
     result = _compose_run("exporter", "run", "exporter.py")
@@ -496,54 +526,100 @@ def _count_iceberg_records(table_name: str) -> int:
 
 def test_data_lands_in_iceberg():
     """
-    End-to-end: produce ~10 MB to Kafka → Duckling lands in DuckLake
+    End-to-end: produce JSON records to Kafka → Duckling lands in DuckLake
     → Exporter exports to Iceberg → count matches.
     """
-    # 0. Ensure Garage S3 is initialized
-    print("\n[0] Setting up Garage S3...")
+    timings: dict[str, float] = {}
+
+    def step(label: str):
+        """Returns (start_time, label) — call finish(start, label) when done."""
+        print(f"\n[step] {label}...")
+        return time.time(), label
+
+    def finish(start: float, label: str):
+        elapsed = time.time() - start
+        timings[label] = elapsed
+        print(f"[step] {label} done ({elapsed:.1f}s)")
+
+    t, lbl = step("Start services (docker compose up + image pulls/builds)")
+    _start_services()
+    finish(t, lbl)
+
+    t, lbl = step("Setup Garage S3")
     _setup_garage()
+    finish(t, lbl)
 
-    # 1. Wait for dependent services to be up
-    print("[1] Waiting for services...")
+    t, lbl = step("Wait for Apicurio")
     _wait_for_http(f"{APICURIO_URL}/groups", timeout=60)
+    finish(t, lbl)
+
+    t, lbl = step("Lakekeeper DB migration + start")
+    _run_lakekeeper_migrate()
+    finish(t, lbl)
+
+    t, lbl = step("Wait for Lakekeeper catalog")
     _wait_for_http(f"{ICEBERG_URL}/catalog/v1/config", timeout=60)
+    finish(t, lbl)
 
-    # 1b. Set up Lakekeeper (idempotent)
-    print("[1b] Setting up Lakekeeper...")
+    t, lbl = step("Setup Lakekeeper warehouse + namespace")
     _setup_lakekeeper()
+    finish(t, lbl)
 
-    # 1c. Verify Iceberg catalog works end-to-end (write + read + drop)
-    print("[1c] Verifying Iceberg catalog (smoke test)...")
+    t, lbl = step("Iceberg catalog smoke test")
     _verify_iceberg_catalog()
+    finish(t, lbl)
 
-    # 2. Reset state from previous runs
-    print("[2] Resetting test state...")
+    t, lbl = step("Prewarm exporter dependencies")
+    _prewarm_exporter()
+    finish(t, lbl)
+
+    t, lbl = step("Reset test state (stop duckling, drop catalog, create topic, start duckling)")
     _reset_test_state()
+    finish(t, lbl)
 
-    # 3. Register schema and set BACKWARD compatibility
-    print("[3] Registering Avro schema in Apicurio...")
-    global_id = _register_schema(None)
+    t, lbl = step("Register JSON schema in Apicurio (idempotent — already done in reset)")
+    _register_schema()
     _set_backward_compatibility(IS_GROUP, ARTIFACT)
-    print(f"    Schema global ID: {global_id}")
+    finish(t, lbl)
 
-    # 4. Produce records — topic was created by _reset_test_state.
-    print(f"[4] Producing {RECORD_COUNT} records (~10 MB) to '{TOPIC}'...")
-    _produce_records(global_id, RECORD_COUNT)
+    t, lbl = step(f"Produce {RECORD_COUNT} records to Kafka")
+    _produce_records(RECORD_COUNT)
+    finish(t, lbl)
 
-    # 5. Wait for Duckling to flush all records to DuckLake.
-    print("[5] Waiting for Duckling to land data in DuckLake...")
+    t, lbl = step("Duckling lands all records in DuckLake")
     final_snap = _wait_for_ducklake_stable(stable_for=8, timeout=300, target_rows=RECORD_COUNT)
-    print(f"    DuckLake stable with data at snapshot {final_snap}.")
+    print(f"    DuckLake stable at snapshot {final_snap}.")
+    finish(t, lbl)
 
-    # 6. Run the exporter
-    print("[6] Running exporter...")
+    t, lbl = step("Run exporter (Iceberg registration)")
     _run_exporter()
+    finish(t, lbl)
 
-    # 7. Validate record count in Iceberg
-    print("[7] Counting records in Iceberg...")
+    t, lbl = step("Count records in Iceberg")
     iceberg_count = _count_iceberg_records(ICEBERG_TABLE)
     print(f"    Iceberg has {iceberg_count} record(s), expected {RECORD_COUNT}")
+    finish(t, lbl)
 
     assert iceberg_count == RECORD_COUNT, (
         f"Expected {RECORD_COUNT} records in Iceberg but found {iceberg_count}"
     )
+
+    total = sum(timings.values())
+    print("\n" + "=" * 60)
+    print("TIMING SUMMARY")
+    print("=" * 60)
+    for label, elapsed in timings.items():
+        print(f"  {elapsed:6.1f}s  {label}")
+    print("-" * 60)
+    print(f"  {total:6.1f}s  TOTAL")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Duckling integration test")
+    parser.add_argument("--count", type=int, default=10_000,
+                        help="Number of records to produce (default: 10000)")
+    args, remaining = parser.parse_known_args()
+    os.environ["RECORD_COUNT"] = str(args.count)
+    sys.exit(pytest.main([__file__, "-v", "-s"] + remaining))

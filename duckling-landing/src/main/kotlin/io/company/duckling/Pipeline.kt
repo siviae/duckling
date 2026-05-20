@@ -2,6 +2,7 @@ package io.company.duckling
 
 import io.company.duckling.config.TopicConfig
 import io.company.duckling.sink.DuckLakeWriter
+import io.company.duckling.source.KafkaRecord
 import io.company.duckling.source.KafkaSource
 import io.company.duckling.source.SchemaValidator
 import io.micrometer.core.instrument.MeterRegistry
@@ -15,8 +16,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
-import org.apache.avro.generic.GenericRecord
-import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
@@ -68,14 +67,14 @@ suspend fun runTopicPipeline(
             try {
                 return@run validator.fetchAndValidate(cfg.isName, cfg.name)
             } catch (e: Exception) {
-                log.warn("Schema not ready for '${cfg.name}': ${e.message}. Retrying in 10s…")
-                delay(10_000)
+                log.warn("Schema not ready for '${cfg.name}': ${e.message}. Retrying in 2s…")
+                delay(2_000)
             }
         }
         @Suppress("UNREACHABLE_CODE") error("unreachable")
     }
 
-    val source = KafkaSource(appBrokers, registryUrl, cfg.group_id, cfg.name)
+    val source = KafkaSource(appBrokers, cfg.group_id, cfg.name)
     //TODO since ensureTable will be called on init, this can be used using with (because it is autocloseable)
     val writer = DuckLakeWriter(catalogUrl, cfg.isName, cfg.tableName, s3Endpoint, s3AccessKey, s3SecretKey, s3Region)
 
@@ -88,7 +87,7 @@ suspend fun runTopicPipeline(
         return
     }
 
-    val recordChannel = Channel<ConsumerRecord<ByteArray, GenericRecord>>(capacity = 1000)
+    val recordChannel = Channel<KafkaRecord>(capacity = 1000)
 
     // Single-threaded context for all Kafka operations — KafkaConsumer is not thread-safe
     val kafkaExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "kafka-${cfg.name}") }
@@ -111,7 +110,7 @@ suspend fun runTopicPipeline(
             }
 
             var currentSchema = initialSchema
-            val batch = mutableListOf<GenericRecord>()
+            val batch = mutableListOf<Map<String, Any?>>()
             val batchStartOffsets = mutableMapOf<Int, Long>()
             var batchBytes = 0L
             var lastFlushTime = Instant.now()
@@ -125,9 +124,9 @@ suspend fun runTopicPipeline(
                     // Reset flush timer when a new batch starts (not at pipeline startup)
                     // so the 30s window measures time-since-first-record, not time-since-init
                     if (batch.isEmpty()) lastFlushTime = Instant.now()
-                    batchStartOffsets.putIfAbsent(record.partition(), record.offset())
-                    batch.add(record.value())
-                    batchBytes += estimateBytes(record.value())
+                    batchStartOffsets.putIfAbsent(record.partition, record.offset)
+                    batch.add(record.value)
+                    batchBytes += estimateBytes(record.value)
                     recordsConsumed?.increment()
                 } else if (recordChannel.isClosedForReceive) {
                     break
@@ -224,12 +223,12 @@ suspend fun runTopicPipeline(
     }
 }
 
-/** Estimates heap bytes consumed by one GenericRecord. Not exact — used only for budget tracking. */
-private fun estimateBytes(record: GenericRecord): Long =
-    record.schema.fields.sumOf { field ->
-        when (val v = record.get(field.name())) {
+/** Estimates heap bytes consumed by one JSON record. Not exact — used only for budget tracking. */
+private fun estimateBytes(record: Map<String, Any?>): Long =
+    record.values.sumOf { v ->
+        when (v) {
             is String -> v.length.toLong() * 2 + 24  // UTF-16 chars + object header
             is ByteArray -> v.size.toLong()
-            else -> 8L                           // Long, Double, Boolean, null
+            else -> 8L                                // Number, Boolean, null
         }
     }
