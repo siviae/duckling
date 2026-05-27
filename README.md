@@ -102,27 +102,93 @@ integration_test/
 | Конфигурация | Jackson YAML 2.17.0 |
 | Экспортёр | Python 3.12, uv, duckdb 1.5.1+, pyiceberg 0.9+, psycopg2 |
 
-## Локальный запуск
+## Запуск интеграционного теста
 
-Поднять все сервисы:
+Тест полностью самодостаточен — поднимает все сервисы с нуля, прогоняет данные end-to-end и проверяет результат.
+
+### Требования
+
+- Docker Desktop (или Docker Engine + Compose plugin)
+- [uv](https://github.com/astral-sh/uv) — менеджер пакетов Python (`brew install uv` / `pip install uv`)
+
+### С нуля (чистое состояние)
+
 ```bash
-docker compose up -d
+# 1. Снести все контейнеры, образы и тома (если запускали раньше)
+docker compose down --volumes --rmi all
+
+# 2. Запустить тест — он сам поднимет всё необходимое
+cd integration_test
+uv run pytest test_landing_to_iceberg.py -s
 ```
 
-Запустить интеграционный тест (1M записей end-to-end):
+Первый запуск скачает все Docker-образы (~1–2 GB) и uv-зависимости — это займёт несколько минут.
+Повторный запуск завершается примерно за **30 секунд**.
+
+### Повторный запуск (контейнеры уже запущены)
+
 ```bash
 cd integration_test
 uv run pytest test_landing_to_iceberg.py -s
 ```
+
+### Параметры
+
+| Переменная / флаг | По умолчанию | Описание |
+|-------------------|-------------|---------|
+| `--count N` | 10 000 | Количество записей для теста |
+| `RECORD_COUNT=N` | 10 000 | То же через переменную окружения |
+
+```bash
+# 1 000 000 записей
+cd integration_test
+uv run pytest test_landing_to_iceberg.py -s -- --count 1000000
+```
+
+### Что делает тест
+
+1. Поднимает Kafka, Postgres, Garage S3, Apicurio, Duckling
+2. Запускает миграцию Lakekeeper и стартует Lakekeeper + Exporter
+3. Регистрирует JSON Schema в Apicurio
+4. Создаёт Kafka-топик и перезапускает Duckling с новым конфигом
+5. Публикует N записей в Kafka
+6. Ждёт, пока Duckling не запишет все записи в DuckLake (Parquet/S3)
+7. Вызывает Exporter — он регистрирует Parquet-файлы в Iceberg через `fast_append`
+8. Проверяет, что в Iceberg ровно N записей
+
+В конце выводится сводка времени по каждому шагу:
+
+```
+============================================================
+TIMING SUMMARY
+============================================================
+     3.5s  Start services (docker compose up + image pulls/builds)
+     2.0s  Lakekeeper DB migration + start
+     0.0s  Wait for exporter server ready
+     4.4s  Reset test state (stop duckling, drop catalog, create topic, start duckling)
+     0.7s  Produce 10000 records to Kafka
+    14.2s  Duckling lands all records in DuckLake
+     0.8s  Run exporter (Iceberg registration)
+------------------------------------------------------------
+    28.9s  TOTAL
+============================================================
+```
+
+## Локальная разработка
 
 Собрать JAR:
 ```bash
 ./gradlew :duckling-landing:jar
 ```
 
-После изменений в коде — пересобрать и перезапустить:
+После изменений в коде Duckling — пересобрать и перезапустить:
 ```bash
 ./gradlew :duckling-landing:jar && docker compose up -d --build duckling
+```
+
+Поднять все сервисы вручную (без теста):
+```bash
+docker compose up -d
 ```
 
 ## Конфигурация
