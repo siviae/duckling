@@ -144,9 +144,9 @@ def _run_lakekeeper_migrate() -> None:
         print(result.stdout)
         print(result.stderr)
         raise RuntimeError(f"lakekeeper-migrate failed (rc={result.returncode})")
-    # Start lakekeeper now that the DB is migrated.
+    # Start lakekeeper and exporter now that the DB is migrated.
     subprocess.run(
-        ["docker", "compose", "up", "-d", "lakekeeper"],
+        ["docker", "compose", "up", "-d", "lakekeeper", "exporter"],
         capture_output=True, text=True, cwd=cwd, check=True,
     )
     print("Lakekeeper migration complete.")
@@ -487,31 +487,21 @@ def _wait_for_ducklake_stable(stable_for: int = 8, timeout: int = 300,
     return max_snap
 
 
+EXPORTER_URL = os.environ.get("EXPORTER_URL", "http://localhost:9091")
+
+
 def _prewarm_exporter() -> None:
-    """Installs exporter dependencies into the uv cache without running real work."""
-    cwd = os.path.join(os.path.dirname(__file__), "..")
-    result = subprocess.run(
-        ["docker", "compose", "run", "--rm",
-         "-e", "UV_PREWARM=1",
-         "-e", f"DUCKLAKE_CATALOG_POSTGRES_URL=jdbc:postgresql://postgres:5432/ducklake?user=duckling&password=duckling",
-         "-e", "AWS_ACCESS_KEY_ID=dummy",
-         "-e", "AWS_SECRET_ACCESS_KEY=dummy",
-         "exporter", "run", "exporter.py"],
-        capture_output=True, text=True, cwd=cwd,
-    )
-    if result.returncode != 0:
-        print(result.stderr[-1000:])
-        raise RuntimeError(f"Exporter prewarm failed (rc={result.returncode})")
-    print("Exporter dependencies prewarmed.")
+    """Waits for the exporter HTTP server to be ready (initialization complete)."""
+    _wait_for_http(f"{EXPORTER_URL}/health", timeout=120)
+    print("Exporter server ready.")
 
 
 def _run_exporter() -> None:
-    """Runs the exporter as a one-off container via docker compose run --rm."""
-    result = _compose_run("exporter", "run", "exporter.py")
-    print(result.stdout[-3000:] if result.stdout else "")
-    if result.returncode != 0:
-        print(result.stderr[-2000:])
-        raise RuntimeError(f"Exporter failed (rc={result.returncode})")
+    """Triggers the exporter via HTTP POST /export."""
+    r = requests.post(f"{EXPORTER_URL}/export", timeout=120)
+    print(r.text[-3000:] if r.text else "")
+    if r.status_code != 200:
+        raise RuntimeError(f"Exporter failed (HTTP {r.status_code})")
 
 
 def _count_iceberg_records(table_name: str) -> int:
@@ -569,7 +559,7 @@ def test_data_lands_in_iceberg():
     _verify_iceberg_catalog()
     finish(t, lbl)
 
-    t, lbl = step("Prewarm exporter dependencies")
+    t, lbl = step("Wait for exporter server ready")
     _prewarm_exporter()
     finish(t, lbl)
 

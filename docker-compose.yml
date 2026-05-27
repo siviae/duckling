@@ -135,6 +135,10 @@ services:
       APICURIO_URL: http://apicurio:8080/apis/registry/v2
       ICEBERG_REST_URL: http://lakekeeper:8181
       ICEBERG_WAREHOUSE: landing
+      EXPORTER_MODE: server
+      EXPORTER_PORT: "9091"
+    ports:
+      - "9091:9091"
     volumes:
       - ./duckling-exporter:/opt/duckling-exporter
       - uv_cache:/root/.cache/uv

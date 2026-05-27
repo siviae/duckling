@@ -183,19 +183,10 @@ def _ducklake_attach_string(p: dict) -> str:
             f"dbname={p['dbname']} user={p['user']} password={p['password']}")
 
 
-def main() -> None:
-    if os.environ.get("UV_PREWARM"):
-        print("[export] Prewarm: dependencies installed.")
-        return
-
-    endpoint_no_scheme = S3_ENDPOINT.removeprefix("http://").removeprefix("https://")
-    use_ssl = S3_ENDPOINT.startswith("https://")
-
-    # Initialise PyArrow's S3 subsystem once (suppresses verbose C++ logs).
-    pafs.initialize_s3(pafs.S3LogLevel.Fatal)
-
-    pg_params = _parse_jdbc_url(DUCKLAKE_CATALOG_URL)
-
+def _do_export(pg_params: dict, endpoint_no_scheme: str, use_ssl: bool,
+               catalog: RestCatalog) -> None:
+    """Creates fresh DuckDB/Postgres connections, runs the export, then closes them.
+    catalog and S3 subsystem are already initialised by the caller."""
     conn = duckdb.connect()
     conn.execute("INSTALL ducklake; LOAD ducklake")
     conn.execute(f"""
@@ -213,6 +204,113 @@ def main() -> None:
 
     pg = psycopg2.connect(**pg_params)
 
+    try:
+        tables = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_catalog = 'ducklake' AND table_schema = 'main'"
+        ).fetchall()
+        print(f"[export] Found {len(tables)} table(s) in DuckLake")
+
+        ns = ICEBERG_WAREHOUSE
+        for (table_name,) in tables:
+            try:
+                parts = table_name.split("__", 1)
+                data_path = f"s3://{parts[0]}/ducklake/main/{table_name}/" if parts else ""
+
+                with pg.cursor() as cur:
+                    cur.execute("""
+                        SELECT df.path, df.path_is_relative,
+                               df.record_count, df.file_size_bytes
+                        FROM ducklake_data_file df
+                        WHERE df.table_id = (
+                            SELECT MAX(table_id) FROM ducklake_table WHERE table_name = %s
+                        )
+                        AND df.end_snapshot IS NULL
+                    """, (table_name,))
+                    rows = cur.fetchall()
+
+                if not rows:
+                    print(f"[export] {table_name}: no Parquet files, skipping")
+                    continue
+
+                all_data_files: list[DataFile] = []
+                for path, is_relative, record_count, file_size in rows:
+                    full_path = (data_path + path) if is_relative and data_path else path
+                    all_data_files.append(DataFile.from_args(
+                        content=DataFileContent.DATA,
+                        file_path=full_path,
+                        file_format=FileFormat.PARQUET,
+                        partition=Record(),
+                        record_count=record_count,
+                        file_size_in_bytes=file_size,
+                    ))
+
+                columns = conn.execute(f'DESCRIBE ducklake.main."{table_name}"').fetchall()
+
+                try:
+                    tbl = catalog.load_table((ns, table_name))
+                    duckdb_cols = {col[0] for col in columns}
+                    iceberg_cols = {f.name for f in tbl.schema().fields}
+                    new_cols = duckdb_cols - iceberg_cols
+                    gone_cols = iceberg_cols - duckdb_cols
+                    if new_cols or gone_cols:
+                        print(f"[export] WARNING {table_name}: schema drift — "
+                              f"new: {new_cols or '∅'}, removed: {gone_cols or '∅'}")
+                    print(f"[export] {table_name}: loaded existing table")
+                except NoSuchTableError:
+                    iceberg_schema, name_mapping = _build_iceberg_schema(columns)
+                    tbl = catalog.create_table(
+                        (ns, table_name),
+                        schema=iceberg_schema,
+                        properties={"schema.name-mapping.default": name_mapping},
+                    )
+                    print(f"[export] {table_name}: created Iceberg table")
+
+                existing_paths: set[str] = set()
+                if tbl.current_snapshot() is not None:
+                    for task in tbl.scan().plan_files():
+                        existing_paths.add(task.file.file_path)
+
+                new_files = [df for df in all_data_files if df.file_path not in existing_paths]
+
+                if not new_files:
+                    print(f"[export] {table_name}: all {len(all_data_files)} file(s) already registered")
+                    continue
+
+                skipped = len(all_data_files) - len(new_files)
+                if skipped:
+                    print(f"[export] {table_name}: skipping {skipped} already-registered file(s)")
+
+                with tbl.transaction() as tx:
+                    with tx.update_snapshot().fast_append() as append:
+                        for df in new_files:
+                            append.append_data_file(df)
+
+                total_rows = sum(df.record_count for df in new_files)
+                print(f"[export] {table_name}: registered {len(new_files)} file(s), "
+                      f"{total_rows} row(s) → {ns}.{table_name}")
+
+            except Exception as e:
+                print(f"[export] WARNING: skipping {table_name} due to error: {e}")
+    finally:
+        conn.close()
+        pg.close()
+
+    print("[export] Done")
+
+
+def _build_export_context() -> tuple:
+    """Performs one-time expensive initialization: S3 subsystem + Iceberg catalog."""
+    endpoint_no_scheme = S3_ENDPOINT.removeprefix("http://").removeprefix("https://")
+    use_ssl = S3_ENDPOINT.startswith("https://")
+    pafs.initialize_s3(pafs.S3LogLevel.Fatal)
+    # Pre-install DuckLake so INSTALL in _do_export() is a fast no-op (no network).
+    _tmp = duckdb.connect()
+    try:
+        _tmp.execute("INSTALL ducklake")
+    finally:
+        _tmp.close()
+    pg_params = _parse_jdbc_url(DUCKLAKE_CATALOG_URL)
     catalog = RestCatalog(
         name=ICEBERG_WAREHOUSE,
         **{
@@ -224,98 +322,70 @@ def main() -> None:
             "s3.region": S3_REGION,
         },
     )
+    return pg_params, endpoint_no_scheme, use_ssl, catalog
 
-    tables = conn.execute(
-        "SELECT table_name FROM information_schema.tables "
-        "WHERE table_catalog = 'ducklake' AND table_schema = 'main'"
-    ).fetchall()
-    print(f"[export] Found {len(tables)} table(s) in DuckLake")
 
-    ns = ICEBERG_WAREHOUSE
-    for (table_name,) in tables:
-        try:
-            parts = table_name.split("__", 1)
-            data_path = f"s3://{parts[0]}/ducklake/main/{table_name}/" if parts else ""
+def _serve() -> None:
+    """Server mode: initialise once, then serve /export over HTTP.
+    GET  /health → 200 ok  (readiness probe)
+    POST /export → 200 output | 500 error message
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import io as _io
 
-            with pg.cursor() as cur:
-                cur.execute("""
-                    SELECT df.path, df.path_is_relative,
-                           df.record_count, df.file_size_bytes
-                    FROM ducklake_data_file df
-                    WHERE df.table_id = (
-                        SELECT MAX(table_id) FROM ducklake_table WHERE table_name = %s
-                    )
-                    AND df.end_snapshot IS NULL
-                """, (table_name,))
-                rows = cur.fetchall()
+    pg_params, endpoint_no_scheme, use_ssl, catalog = _build_export_context()
+    port = int(os.environ.get("EXPORTER_PORT", "9091"))
+    print(f"[export] Server ready on :{port}")
 
-            if not rows:
-                print(f"[export] {table_name}: no Parquet files, skipping")
-                continue
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok\n")
+            else:
+                self.send_response(404)
+                self.end_headers()
 
-            all_data_files: list[DataFile] = []
-            for path, is_relative, record_count, file_size in rows:
-                full_path = (data_path + path) if is_relative and data_path else path
-                all_data_files.append(DataFile.from_args(
-                    content=DataFileContent.DATA,
-                    file_path=full_path,
-                    file_format=FileFormat.PARQUET,
-                    partition=Record(),
-                    record_count=record_count,
-                    file_size_in_bytes=file_size,
-                ))
+        def do_POST(self):
+            if self.path == "/export":
+                buf = _io.StringIO()
+                import contextlib
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        _do_export(pg_params, endpoint_no_scheme, use_ssl, catalog)
+                    body = buf.getvalue().encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as e:
+                    body = f"ERROR: {e}\n{buf.getvalue()}".encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
 
-            columns = conn.execute(f'DESCRIBE ducklake.main."{table_name}"').fetchall()
+        def log_message(self, fmt, *args):
+            pass  # suppress per-request access logs
 
-            try:
-                tbl = catalog.load_table((ns, table_name))
-                duckdb_cols = {col[0] for col in columns}
-                iceberg_cols = {f.name for f in tbl.schema().fields}
-                new_cols = duckdb_cols - iceberg_cols
-                gone_cols = iceberg_cols - duckdb_cols
-                if new_cols or gone_cols:
-                    print(f"[export] WARNING {table_name}: schema drift — "
-                          f"new: {new_cols or '∅'}, removed: {gone_cols or '∅'}")
-                print(f"[export] {table_name}: loaded existing table")
-            except NoSuchTableError:
-                iceberg_schema, name_mapping = _build_iceberg_schema(columns)
-                tbl = catalog.create_table(
-                    (ns, table_name),
-                    schema=iceberg_schema,
-                    properties={"schema.name-mapping.default": name_mapping},
-                )
-                print(f"[export] {table_name}: created Iceberg table")
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-            existing_paths: set[str] = set()
-            if tbl.current_snapshot() is not None:
-                for task in tbl.scan().plan_files():
-                    existing_paths.add(task.file.file_path)
 
-            new_files = [df for df in all_data_files if df.file_path not in existing_paths]
+def main() -> None:
+    if os.environ.get("UV_PREWARM"):
+        print("[export] Prewarm: dependencies installed.")
+        return
 
-            if not new_files:
-                print(f"[export] {table_name}: all {len(all_data_files)} file(s) already registered")
-                continue
+    if os.environ.get("EXPORTER_MODE") == "server":
+        _serve()
+        return
 
-            skipped = len(all_data_files) - len(new_files)
-            if skipped:
-                print(f"[export] {table_name}: skipping {skipped} already-registered file(s)")
-
-            with tbl.transaction() as tx:
-                with tx.update_snapshot().fast_append() as append:
-                    for df in new_files:
-                        append.append_data_file(df)
-
-            total_rows = sum(df.record_count for df in new_files)
-            print(f"[export] {table_name}: registered {len(new_files)} file(s), "
-                  f"{total_rows} row(s) → {ns}.{table_name}")
-
-        except Exception as e:
-            print(f"[export] WARNING: skipping {table_name} due to error: {e}")
-
-    conn.close()
-    pg.close()
-    print("[export] Done")
+    pg_params, endpoint_no_scheme, use_ssl, catalog = _build_export_context()
+    _do_export(pg_params, endpoint_no_scheme, use_ssl, catalog)
 
 
 if __name__ == "__main__":
